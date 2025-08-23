@@ -1,10 +1,12 @@
 import os
 import io
+import base64
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
@@ -185,18 +187,27 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
         "quotation no": str(data.get("quotation_no", "")),
     }
 
+    # Labels for which we should remove the title text (customer info block only)
+    STRIP_LABELS = set([
+        "customer name", "location", "city", "state",
+        "pincode", "pin code",
+        "phone", "customer no", "mobile no", "mobile number",
+    ])
+
     def replace_in_paragraph(p: Paragraph, label: str, value: str, all_labels: List[str]):
         text = p.text
         text_lower = text.lower()
         # detect label with ':' or '-'
         candidates = [f"{label}:", f"{label}-"]
-        start_idx = -1
+        label_start = -1
+        label_end = -1
         for cand in candidates:
-            start_idx = text_lower.find(cand)
-            if start_idx != -1:
-                start_idx += len(cand)
+            idx = text_lower.find(cand)
+            if idx != -1:
+                label_start = idx
+                label_end = idx + len(cand)
                 break
-        if start_idx == -1:
+        if label_start == -1:
             return  # label not in this paragraph
 
         # find the next other label occurrence to bound our clearing range
@@ -205,10 +216,10 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
             if other == label:
                 continue
             for sep in (":", "-"):
-                i = text_lower.find(f"{other}{sep}", start_idx)
+                i = text_lower.find(f"{other}{sep}", label_end)
                 if i != -1:
                     next_idx = min(next_idx, i)
-        # iterate runs and find first yellow run whose run range begins after start_idx and before next_idx
+        # iterate runs and find first yellow run whose run range begins after label_end and before next_idx
         pos = 0
         replaced = False
         for r in p.runs:
@@ -216,7 +227,7 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
             begin = pos
             end = pos + len(rt)
             pos = end
-            if end <= start_idx:
+            if end <= label_end:
                 continue
             if begin >= next_idx:
                 break
@@ -230,6 +241,25 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
                         r.text = ""
             except Exception:
                 pass
+
+        # Second pass: remove the label text portion itself ONLY for customer info labels
+        if label in STRIP_LABELS:
+            pos = 0
+            for r in p.runs:
+                rt = r.text
+                begin = pos
+                end = pos + len(rt)
+                pos = end
+                # full overlap with label => clear
+                if end <= label_end and end > label_start:
+                    r.text = ""
+                # partial overlap => trim the label part
+                elif begin < label_end < end:
+                    keep_from = label_end - begin
+                    try:
+                        r.text = rt[keep_from:]
+                    except Exception:
+                        pass
 
     search_paras = iter_paragraphs_and_cells(doc)
     label_list = list(targets.keys())
@@ -304,6 +334,17 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
             except Exception:
                 pass
 
+
+def clear_all_highlights(doc: DocxDocument) -> None:
+    """Remove highlight formatting from all runs in the document (paragraphs and tables)."""
+    for p in iter_paragraphs_and_cells(doc):
+        for r in p.runs:
+            try:
+                # Setting to None clears any highlight color
+                r.font.highlight_color = None
+            except Exception:
+                pass
+
 # ---------------------------
 # Core required functions
 # ---------------------------
@@ -370,6 +411,54 @@ def create_invoice(form_data: Dict[str, str]) -> Tuple[str, Optional[str]]:
         conn.close()
 
 
+def _render_pdf_preview(pdf_path: str, height: int = 700) -> None:
+    """Render a PDF inline using PDF.js to avoid Chrome blocking the built-in viewer in sandboxed iframes."""
+    try:
+        with open(pdf_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        # Minimal PDF.js renderer for all pages
+        html = f"""
+        <div id="pdf_root"></div>
+        <script src="https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+        <script>
+        (function() {{
+            const pdfData = atob('{b64}');
+            const bytes = new Uint8Array(pdfData.length);
+            for (let i = 0; i < pdfData.length; i++) bytes[i] = pdfData.charCodeAt(i);
+            const CMAP_URL = 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/';
+            const ROOT = document.getElementById('pdf_root');
+            ROOT.style.border = '1px solid #e5e7eb';
+            ROOT.style.borderRadius = '10px';
+            ROOT.style.padding = '8px';
+            const loadingTask = window['pdfjsLib'].getDocument({{ data: bytes, cMapUrl: CMAP_URL, cMapPacked: true }});
+            loadingTask.promise.then(function(pdf) {{
+                const scale = 1.1;
+                const renderPage = function(num) {{
+                    pdf.getPage(num).then(function(page) {{
+                        const viewport = page.getViewport({{ scale }});
+                        const canvas = document.createElement('canvas');
+                        canvas.style.display = 'block';
+                        canvas.style.margin = '0 auto 8px auto';
+                        const context = canvas.getContext('2d');
+                        canvas.height = viewport.height;
+                        canvas.width = viewport.width;
+                        ROOT.appendChild(canvas);
+                        page.render({{ canvasContext: context, viewport: viewport }});
+                    }});
+                }};
+                for (let i = 1; i <= pdf.numPages; i++) renderPage(i);
+            }}).catch(function(err) {{
+                ROOT.innerHTML = '<div style="color:#ef4444">Failed to load preview.</div>';
+                console.error(err);
+            }});
+        }})();
+        </script>
+        """
+        components.html(html, height=height, scrolling=True)
+    except Exception:
+        st.warning("Preview not available.")
+
+
 def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Template not found at {TEMPLATE_PATH}")
@@ -377,6 +466,9 @@ def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.B
 
     # Replace values by labels for accuracy
     replace_by_labels(doc, form_data)
+
+    # Remove any yellow highlighting so final PDF has clean text
+    clear_all_highlights(doc)
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -620,13 +712,11 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
                 docx_path, pdf_path = edit_invoice(edit_id, data)
                 st.success("Invoice updated successfully.")
                 st.toast("Invoice updated", icon="✏️")
-            if pdf_path is None:
-                st.warning("PDF conversion failed or Word is not available. DOCX was generated.")
-            with open(docx_path, "rb") as f:
-                st.download_button("Download DOCX", data=f.read(), file_name=os.path.basename(docx_path), mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             if pdf_path and os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
                     st.download_button("Download PDF", data=f.read(), file_name=os.path.basename(pdf_path), mime="application/pdf")
+            else:
+                st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word installed.")
         except Exception as e:
             st.error(f"Failed to process invoice: {e}")
 
@@ -658,45 +748,231 @@ def render_search_tab():
 
     filtered = df[mask].reset_index(drop=True)
 
-    st.dataframe(filtered[["customer_name", "product", "date_of_quotation", "quotation_no"]], use_container_width=True)
+    # Handle action links via query params (modern API)
+    qp = st.query_params
+    def _first(v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    action = _first(qp.get("action"))
+    action_id = _first(qp.get("id"))
+    if action and action_id:
+        try:
+            rid = int(action_id)
+            if action == "preview":
+                st.session_state["preview_id"] = rid
+            elif action == "edit":
+                st.session_state["selected_edit_id"] = rid
+                st.session_state.pop("preview_id", None)
+            elif action == "delete":
+                delete_invoice(rid)
+                st.success("Deleted.")
+            # Clear params to avoid repeat on next runs (no extra rerun here)
+            st.query_params.clear()
+        except Exception:
+            pass
 
-    st.markdown("### Actions")
-    for _, row in filtered.iterrows():
-        with st.container():
-            c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 1, 1, 1])
-            with c1:
-                st.write(f"Customer: **{row['customer_name']}**")
-                st.caption(f"Quotation: {row['quotation_no']}")
-            with c2:
-                st.write(row["product"])
-            with c3:
-                st.write(row["date_of_quotation"]) 
-            with c4:
-                if row["docx_path"] and os.path.exists(row["docx_path"]):
-                    with open(row["docx_path"], "rb") as f:
-                        st.download_button("DOCX", f.read(), file_name=os.path.basename(row["docx_path"]), key=f"docx_{row['id']}")
-                else:
-                    st.button("DOCX", disabled=True, key=f"docx_{row['id']}")
-            with c5:
-                if row["pdf_path"] and os.path.exists(row["pdf_path"]):
-                    with open(row["pdf_path"], "rb") as f:
-                        st.download_button("PDF", f.read(), file_name=os.path.basename(row["pdf_path"]), key=f"pdf_{row['id']}")
-                else:
-                    st.button("PDF", disabled=True, key=f"pdf_{row['id']}")
-            with c6:
-                st.write("")
+    # Toggle for mobile card view
+    mobile_view = st.toggle("Mobile card view", value=True, key="mobile_card_toggle")
 
-            c7, c8 = st.columns([1, 1])
-            with c7:
-                if st.button("Edit", key=f"edit_{row['id']}"):
-                    prefill = fetch_full_record(row["id"]) or {}
+    # Light CSS for compact icon buttons and spacing
+    st.markdown(
+        """
+        <style>
+        .card-header {display:flex; justify-content:space-between; align-items:center;}
+        .card-title {font-weight:600; margin: 0;}
+        .meta {color:#6b7280; font-size:12px; margin: 0;}
+        /* Make Streamlit buttons look compact */
+        .stButton>button {padding: 0.35rem 0.6rem; border-radius:999px; font-size:13px;}
+        .stDownloadButton>button {padding: 0.35rem 0.6rem; border-radius:999px; font-size:13px;}
+        /* Force inline horizontal layout for buttons even on mobile */
+        .stButton, .stDownloadButton {display:inline-block !important; margin: 0 8px 8px 0 !important;}
+        .stButton>button, .stDownloadButton>button {min-width: 36px; height: 36px;}
+        .card-block {padding-top: 0.25rem;}
+        .action-links {display:flex; align-items:center; gap: 10px; flex-wrap: nowrap; margin-bottom: 16px;}
+        .action-links a {text-decoration:none; color:#374151; background:#f3f4f6; padding:6px 10px; border-radius:999px; font-size:13px; display:inline-flex; align-items:center; gap:6px;}
+        .action-links a:hover {background:#e5e7eb;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Smooth UX: preserve scroll position across reruns so actions feel inline without jump
+    components.html(
+        """
+        <script>
+        (function(){
+          const KEY = 'search_invoice_scrollY';
+          const y = sessionStorage.getItem(KEY);
+          if (y) { try { window.scrollTo(0, parseInt(y)); } catch (e) {} }
+          window.addEventListener('beforeunload', function(){
+            try { sessionStorage.setItem(KEY, String(window.scrollY)); } catch(e) {}
+          });
+        })();
+        </script>
+        """,
+        height=1,
+    )
+
+    if mobile_view:
+        # Card layout per row (good on mobile)
+        for _, row in filtered.iterrows():
+            with st.container(border=True):
+                pdf_path = row.get("pdf_path") if "pdf_path" in row else None
+
+                # Header (no actions here to avoid vertical stacking on small screens)
+                top_l, _ = st.columns([7, 3])
+                with top_l:
+                    st.markdown(
+                        f"<p class='card-title'>{row['customer_name']}</p>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f"<p class='meta'>Quotation No: {row['quotation_no']}</p>",
+                        unsafe_allow_html=True,
+                    )
+                # Actions: force single horizontal row using 4 columns
+                rid = int(row["id"])
+                a1, a2, a3, a4 = st.columns([1, 1, 1, 1])
+                with a1:
+                    if st.button("👁️  Preview", key=f"m_prev_{rid}", use_container_width=True):
+                        st.session_state["preview_id"] = rid
+                        st.session_state.pop("selected_edit_id", None)
+                with a2:
+                    if pdf_path and os.path.exists(pdf_path):
+                        try:
+                            with open(pdf_path, "rb") as f:
+                                st.download_button(
+                                    "⬇️  Download",
+                                    data=f.read(),
+                                    file_name=os.path.basename(pdf_path),
+                                    mime="application/pdf",
+                                    key=f"m_dl_{rid}",
+                                    use_container_width=True,
+                                )
+                        except Exception:
+                            st.button("⬇️  Download", disabled=True, key=f"m_dl_dis_{rid}", use_container_width=True)
+                    else:
+                        st.button("⬇️  Download", disabled=True, key=f"m_dl_na_{rid}", use_container_width=True)
+                with a3:
+                    if st.button("✏️  Edit", key=f"m_edit_{rid}", use_container_width=True):
+                        st.session_state["selected_edit_id"] = rid
+                        st.session_state.pop("preview_id", None)
+                with a4:
+                    if st.button("🗑️  Delete", key=f"m_del_{rid}", use_container_width=True):
+                        delete_invoice(rid)
+                        st.success("Deleted.")
+
+                # Compact details with View more (show all key fields)
+                with st.expander("View details", expanded=False):
+                    rec = fetch_full_record(rid) or {}
+                    def v(key):
+                        return rec.get(key, "")
+                    st.markdown(f"**Quotation No (auto)**: {v('quotation_no')}")
+                    st.markdown(f"**Product & Service**: {v('product')}")
+                    st.markdown(f"**Customer Name**: {v('customer_name')}")
+                    st.markdown(f"**Mobile Number**: {v('mobile')}")
+                    st.markdown(f"**Location**: {v('location')}")
+                    st.markdown(f"**City**: {v('city')}")
+                    st.markdown(f"**State**: {v('state')}")
+                    st.markdown(f"**Pincode**: {v('pincode')}")
+                    st.markdown(f"**Staff Name (kept only in DB)**: {v('staff_name')}")
+                    st.markdown(f"**Date of Quotation**: {v('date_of_quotation')}")
+                    st.markdown(f"**Validity**: {v('validity_date')}")
+
+                # Inline PDF preview (if chosen)
+                if st.session_state.get("preview_id") == int(row["id"]) and pdf_path and os.path.exists(pdf_path):
+                    _render_pdf_preview(pdf_path, height=480)
+                    if st.button("Close preview", key=f"m_close_prev_{row['id']}"):
+                        st.session_state.pop("preview_id", None)
+                        st.rerun()
+
+                # Inline Edit panel (only for the selected card)
+                if st.session_state.get("selected_edit_id") == int(row["id"]):
+                    st.markdown("#### Edit Invoice")
+                    prefill = fetch_full_record(int(row["id"])) or {}
+                    c_cancel, _ = st.columns([1, 6])
+                    with c_cancel:
+                        if st.button("Close", key=f"close_edit_inline_{row['id']}"):
+                            st.session_state.pop("selected_edit_id", None)
+                            st.rerun()
                     render_create_form(prefill=prefill, edit_id=int(row["id"]))
-                    st.stop()
-            with c8:
-                if st.button("Delete", key=f"del_{row['id']}"):
-                    delete_invoice(int(row["id"]))
+
+        return
+
+    # Desktop-like table layout with single Action column (previous behavior)
+    # Header
+    h1, h2, h3, h4, h5 = st.columns([2.5, 2.5, 2, 2, 2])
+    with h1:
+        st.markdown("**Customer**")
+    with h2:
+        st.markdown("**Product**")
+    with h3:
+        st.markdown("**Date of Quotation**")
+    with h4:
+        st.markdown("**Quotation No**")
+    with h5:
+        st.markdown("**Action**")
+
+    # Rows
+    for _, row in filtered.iterrows():
+        rid = int(row["id"])
+        pdf_path = row.get("pdf_path") if "pdf_path" in row else None
+        c1, c2, c3, c4, c5 = st.columns([2.5, 2.5, 2, 2, 2])
+        with c1:
+            st.write(row["customer_name"])  
+        with c2:
+            st.write(row["product"]) 
+        with c3:
+            st.write(row["date_of_quotation"]) 
+        with c4:
+            st.write(row["quotation_no"]) 
+        with c5:
+            a1, a2, a3, a4 = st.columns([1, 1, 1, 1])
+            with a1:
+                if st.button("👁️", key=f"d_prev_{rid}", use_container_width=True):
+                    st.session_state["preview_id"] = rid
+                    st.session_state.pop("selected_edit_id", None)
+            with a2:
+                if pdf_path and os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as f:
+                        st.download_button("⬇️", f.read(), file_name=os.path.basename(pdf_path), key=f"d_dl_{rid}", use_container_width=True)
+                else:
+                    st.button("⬇️", disabled=True, key=f"d_dl_na_{rid}", use_container_width=True)
+            with a3:
+                if st.button("✏️", key=f"d_edit_{rid}", use_container_width=True):
+                    st.session_state["selected_edit_id"] = rid
+                    st.session_state.pop("preview_id", None)
+                    st.rerun()
+            with a4:
+                if st.button("🗑️", key=f"d_del_{rid}", use_container_width=True):
+                    delete_invoice(rid)
                     st.success("Deleted.")
-                    st.experimental_rerun()
+                    st.rerun()
+
+        # Inline preview right under the targeted row (desktop view), same as mobile behavior
+        if st.session_state.get("preview_id") == rid and pdf_path and os.path.exists(pdf_path):
+            with st.container():
+                _render_pdf_preview(pdf_path, height=480)
+                if st.button("Close preview", key=f"d_close_preview_{rid}"):
+                    st.session_state.pop("preview_id", None)
+                    st.rerun()
+
+        # Inline edit panel right under the targeted row (desktop view), same as mobile behavior
+        if st.session_state.get("selected_edit_id") == rid:
+            with st.container():
+                st.markdown("#### Edit Invoice")
+                prefill = fetch_full_record(rid) or {}
+                c_cancel, _ = st.columns([1, 6])
+                with c_cancel:
+                    if st.button("Close", key=f"d_close_edit_{rid}"):
+                        st.session_state.pop("selected_edit_id", None)
+                        st.rerun()
+                render_create_form(prefill=prefill, edit_id=rid)
+
+    # Global preview/edit panels are intentionally removed for desktop table view to keep UI inline per row
 
 
 def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
