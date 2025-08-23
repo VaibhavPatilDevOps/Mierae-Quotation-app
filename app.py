@@ -933,21 +933,32 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
             "date_of_quotation": date_of_quotation.isoformat(),
             "validity_date": validity_date.isoformat(),
         }
+        # Minimal progress UI (non-intrusive)
+        prog = st.progress(0, text="Starting…")
+        status = st.empty()
         try:
+            prog.progress(10, text="Processing invoice…")
+            status.write("Generating files…")
             if edit_id is None:
                 docx_path, pdf_path = create_invoice(data)
+                prog.progress(70, text="Finalizing creation…")
                 st.success("Invoice created successfully.")
                 st.toast(f"Saved invoice {qno_preview}", icon="✅")
             else:
                 docx_path, pdf_path = edit_invoice(edit_id, data)
+                prog.progress(70, text="Finalizing update…")
                 st.success("Invoice updated successfully.")
                 st.toast("Invoice updated", icon="✏️")
             if pdf_path and os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
+                    prog.progress(90, text="Preparing download…")
                     st.download_button("Download PDF", data=f.read(), file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    prog.progress(100, text="Done")
             else:
+                prog.progress(100, text="Completed (PDF unavailable)")
                 st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word installed.")
         except Exception as e:
+            prog.progress(100, text="Failed")
             st.error(f"Failed to process invoice: {e}")
 
 
