@@ -2,6 +2,8 @@ import os
 import io
 import base64
 import sqlite3
+import subprocess
+import shutil
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 
@@ -485,8 +487,43 @@ def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.B
 
 
 def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
+    # Ensure target directory exists
     try:
-        # docx2pdf requires Word on Windows. We'll attempt, but tolerate failures.
+        os.makedirs(os.path.dirname(target_pdf_path), exist_ok=True)
+    except Exception:
+        pass
+
+    # 1) Try LibreOffice (fast, headless) if available (works on Linux/Streamlit Cloud)
+    try:
+        soffice = shutil.which("soffice") or shutil.which("soffice.exe")
+        if soffice and os.path.exists(docx_path):
+            outdir = os.path.dirname(target_pdf_path)
+            cmd = [
+                soffice,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                outdir,
+                docx_path,
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            base = os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+            produced = os.path.join(outdir, base)
+            if os.path.exists(produced):
+                if os.path.abspath(produced) != os.path.abspath(target_pdf_path):
+                    try:
+                        if os.path.exists(target_pdf_path):
+                            os.remove(target_pdf_path)
+                    except Exception:
+                        pass
+                    os.replace(produced, target_pdf_path)
+                return target_pdf_path
+    except Exception:
+        pass
+
+    # 2) Fallback: Word via docx2pdf (Windows only)
+    try:
         docx2pdf_convert(docx_path, target_pdf_path)
         return target_pdf_path if os.path.exists(target_pdf_path) else None
     except Exception:
