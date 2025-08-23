@@ -848,33 +848,7 @@ def render_dashboard():
     except Exception:
         st.caption("Unable to render chart.")
 
-    # Sort and show card view
-    df_cards = df_view.sort_values("date_of_quotation", ascending=(sort_opt == "Oldest first"))
-    st.markdown("### Invoices")
-    if df_cards.empty:
-        st.info("No invoices in the selected range.")
-        return
-
-    for _, r in df_cards.iterrows():
-        with st.container(border=True):
-            top_l, top_r = st.columns([6, 4])
-            with top_l:
-                st.markdown(f"**{r['customer_name']}**")
-                st.caption(f"Quotation No: {r['quotation_no']}")
-            with top_r:
-                st.caption(r.get("product", ""))
-                st.caption(f"Date: {r['date_of_quotation']}")
-
-            # Quick actions (links) – persist query params for Search tab to pick up
-            rid = int(r["id"]) if not pd.isna(r["id"]) else None
-            if rid is not None:
-                link_row = []
-                link_row.append(f"<a href='?action=preview&id={rid}'>Preview in Search</a>")
-                link_row.append(f"<a href='?action=edit&id={rid}'>Edit in Search</a>")
-                if isinstance(r.get("pdf_path"), str) and os.path.exists(r.get("pdf_path")):
-                    fname = os.path.basename(r.get("pdf_path"))
-                    link_row.append(f"<a href='file://{r.get('pdf_path')}' download='{fname}'>Download PDF</a>")
-                st.markdown(" | ".join(link_row), unsafe_allow_html=True)
+    # Invoices section intentionally removed
 
 def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Optional[int] = None):
     conn = get_conn()
