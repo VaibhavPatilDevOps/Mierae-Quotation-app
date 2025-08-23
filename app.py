@@ -32,12 +32,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 from docx import Document
-from docx.enum.text import WD_COLOR_INDEX
+from docx.enum.text import WD_COLOR_INDEX, WD_ALIGN_PARAGRAPH
 from docx.text.run import Run
 from docx.oxml.shared import OxmlElement, qn
 from docx.document import Document as DocxDocument
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
+from docx.shared import Inches
 from docx2pdf import convert as docx2pdf_convert
 
 # ---------------------------
@@ -498,6 +499,9 @@ def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.B
     # Replace values by labels for accuracy
     replace_by_labels(doc, form_data)
 
+    # Normalize layout to minimize LO vs Word differences
+    normalize_layout(doc)
+
     # Remove any yellow highlighting so final PDF has clean text
     clear_all_highlights(doc)
 
@@ -505,6 +509,88 @@ def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.B
     doc.save(bio)
     bio.seek(0)
     return bio
+
+
+def normalize_layout(doc: DocxDocument) -> None:
+    """Stabilize table layout and currency formatting so LibreOffice doesn't wrap unexpectedly.
+    - Turn off table autofit so column widths are respected
+    - Apply fixed widths to the items table columns when detected
+    - Right-align numeric/currency columns
+    - Replace "₹ " with non-breaking space variant "₹\u00A0" so symbol sticks to the amount
+    - Keep two-column detail table widths reasonable to avoid label/value wrapping
+    """
+    # Helper to set entire column width
+    def set_col_width(table: Table, col_idx: int, width_in: float):
+        w = Inches(width_in)
+        for r in table.rows:
+            try:
+                r.cells[col_idx].width = w
+            except Exception:
+                pass
+
+    # Replace rupee+space globally to prevent breaks
+    for p in iter_paragraphs_and_cells(doc):
+        for r in p.runs:
+            try:
+                if "₹ " in r.text:
+                    r.text = r.text.replace("₹ ", "₹\u00A0")
+            except Exception:
+                pass
+
+    for table in doc.tables:
+        try:
+            table.autofit = False
+        except Exception:
+            pass
+
+        # Try to detect the items table by headers
+        headers = []
+        try:
+            if table.rows:
+                headers = [c.text.strip().lower() for c in table.rows[0].cells]
+        except Exception:
+            headers = []
+
+        if headers and ("item name" in headers or "itemname" in headers) and ("amount" in headers):
+            # Approximate column widths in inches matching an A4 portrait printable width (~6.2in content area)
+            # [S.No, Item name, Qty, Price/Unit, GST(%), GST(Amount), Amount]
+            col_widths = [0.5, 3.0, 0.7, 1.0, 0.8, 1.1, 1.1]
+            for idx, w in enumerate(col_widths):
+                if idx < len(table.columns):
+                    set_col_width(table, idx, w)
+
+            # Right-align numeric columns
+            num_cols = []
+            for key in ("price/ unit", "price/unit", "gst (amount)", "gst amount", "amount", "gst (%)", "gst%"):
+                if key in headers:
+                    num_cols.append(headers.index(key))
+            # Fallback known positions if headers not matched precisely
+            if not num_cols and len(headers) >= 7:
+                num_cols = [3, 4, 5, 6]
+            for r in table.rows:
+                for ci in num_cols:
+                    if ci < len(r.cells):
+                        for p in r.cells[ci].paragraphs:
+                            try:
+                                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                            except Exception:
+                                pass
+                        for p in r.cells[ci].paragraphs:
+                            for run in p.runs:
+                                try:
+                                    if "₹ " in run.text:
+                                        run.text = run.text.replace("₹ ", "₹\u00A0")
+                                except Exception:
+                                    pass
+        else:
+            # Heuristic for 2-column details table (labels/values block)
+            try:
+                if len(table.columns) == 2 and len(table.rows) >= 2:
+                    # Allocate ~62% / 38% of width
+                    set_col_width(table, 0, 3.8)
+                    set_col_width(table, 1, 2.3)
+            except Exception:
+                pass
 
 
 def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
