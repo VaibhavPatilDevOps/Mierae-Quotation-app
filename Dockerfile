@@ -10,8 +10,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libreoffice \
+        libreoffice-writer \
         fonts-dejavu \
+        fonts-liberation \
+        fonts-crosextra-carlito \
+        fonts-crosextra-caladea \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
         locales \
+    && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure a UTF-8 locale (some PDF conversions rely on it)
