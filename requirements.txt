@@ -2,3 +2,4 @@ streamlit==1.37.0
 pandas==2.2.2
 python-docx==1.1.2
 docx2pdf==0.1.8
+comtypes==1.2.0; platform_system == "Windows"
