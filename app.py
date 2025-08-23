@@ -349,9 +349,9 @@ def clear_all_highlights(doc: DocxDocument) -> None:
 # Core required functions
 # ---------------------------
 
-def create_invoice(form_data: Dict[str, str]) -> Tuple[str, Optional[str]]:
-    """Create invoice: generate DOCX, convert to PDF, and save DB record.
-    Returns (docx_path, pdf_path or None if conversion failed)
+def create_invoice(form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """Create invoice: generate DOCX (temporary), convert to PDF, save DB record.
+    Returns (None, pdf_path or None if conversion failed). We no longer persist DOCX files.
     """
     ensure_dirs()
     conn = get_conn()
@@ -377,7 +377,7 @@ def create_invoice(form_data: Dict[str, str]) -> Tuple[str, Optional[str]]:
         ]
 
         docx_bytes = generate_docx(values, form_data)
-        # Save DOCX
+        # Save DOCX temporarily (needed for conversion) – will delete after PDF is created
         safe_customer = safe_filename(form_data["customer_name"]) if form_data.get("customer_name") else "customer"
         safe_qno = safe_filename(form_data["quotation_no"]) if form_data.get("quotation_no") else "qno"
         base_name = f"{safe_customer.strip()}+{safe_qno}"
@@ -400,13 +400,21 @@ def create_invoice(form_data: Dict[str, str]) -> Tuple[str, Optional[str]]:
             pass
         pdf_path = convert_to_pdf(docx_path, target_pdf)
 
+        # Delete the temporary DOCX and do not store it
+        try:
+            if os.path.exists(docx_path):
+                os.remove(docx_path)
+        except Exception:
+            pass
+        persisted_docx_path: Optional[str] = None
+
         # Save DB
         save_to_db(conn, {
             **form_data,
-            "docx_path": docx_path,
+            "docx_path": persisted_docx_path,
             "pdf_path": pdf_path,
         })
-        return docx_path, pdf_path
+        return persisted_docx_path, pdf_path
     finally:
         conn.close()
 
@@ -551,18 +559,20 @@ def delete_invoice(inv_id: int) -> None:
         conn.close()
 
 
-def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[str, Optional[str]]:
-    """Update record and regenerate files. Returns (docx_path, pdf_path)."""
+def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """Update record and regenerate files. Returns (None, pdf_path).
+    We no longer persist DOCX files; use temporary DOCX for conversion only.
+    """
     ensure_dirs()
     conn = get_conn()
     try:
         # Fetch existing quotation_no to keep it stable
         cur = conn.cursor()
-        cur.execute("SELECT quotation_no FROM invoices WHERE id = ?", (inv_id,))
+        cur.execute("SELECT quotation_no, docx_path FROM invoices WHERE id = ?", (inv_id,))
         row = cur.fetchone()
         if not row:
             raise ValueError("Invoice not found")
-        quotation_no = row[0]
+        quotation_no, old_docx_path = row[0], row[1]
         form_data = dict(form_data)
         form_data["quotation_no"] = quotation_no
 
@@ -583,11 +593,23 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[str, Optional[
         safe_customer = safe_filename(form_data["customer_name"]) if form_data.get("customer_name") else "customer"
         safe_qno = safe_filename(form_data["quotation_no"]) if form_data.get("quotation_no") else "qno"
         base_name = f"{safe_customer.strip()}+{safe_qno}"
-        docx_path = os.path.join(DOCX_DIR, f"{base_name}.docx")
-        with open(docx_path, "wb") as f:
+        temp_docx_path = os.path.join(DOCX_DIR, f"{base_name}.docx")
+        with open(temp_docx_path, "wb") as f:
             f.write(docx_bytes.getvalue())
 
-        pdf_path = convert_to_pdf(docx_path, os.path.join(PDF_DIR, f"{base_name}.pdf"))
+        pdf_path = convert_to_pdf(temp_docx_path, os.path.join(PDF_DIR, f"{base_name}.pdf"))
+
+        # Delete temporary docx and any previously stored docx
+        try:
+            if os.path.exists(temp_docx_path):
+                os.remove(temp_docx_path)
+        except Exception:
+            pass
+        try:
+            if old_docx_path and os.path.exists(old_docx_path):
+                os.remove(old_docx_path)
+        except Exception:
+            pass
 
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(
@@ -608,14 +630,14 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[str, Optional[
                 form_data.get("staff_name"),
                 form_data.get("date_of_quotation"),
                 form_data.get("validity_date"),
-                docx_path,
+                None,
                 pdf_path,
                 now,
                 inv_id,
             ),
         )
         conn.commit()
-        return docx_path, pdf_path
+        return None, pdf_path
     finally:
         conn.close()
 
