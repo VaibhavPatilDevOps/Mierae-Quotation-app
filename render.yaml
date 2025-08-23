@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mierae-quotation-app
+    runtime: docker
+    repo: https://github.com/shuvomistry-cj/Mierae-Quotation-app
+    branch: main
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
+    plan: starter
