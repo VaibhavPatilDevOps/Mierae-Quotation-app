@@ -4,8 +4,29 @@ import base64
 import sqlite3
 import subprocess
 import shutil
+import sys
+import importlib
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
+
+# Ensure critical third-party packages are present (Streamlit Cloud may cache deps)
+def _ensure_pkg(pkg_spec: str, import_name: str) -> None:
+    try:
+        importlib.import_module(import_name)
+        return
+    except Exception:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg_spec, "--no-input"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            # Last attempt with visible logs for debugging
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg_spec], check=True)
+        importlib.invalidate_caches()
+        importlib.import_module(import_name)
+
+# Only ensure the ones that have failed on Cloud in practice
+_ensure_pkg("python-docx==1.1.2", "docx")
+_ensure_pkg("docx2pdf==0.1.8", "docx2pdf")
 
 import streamlit as st
 import streamlit.components.v1 as components
