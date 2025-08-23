@@ -633,7 +633,7 @@ def main():
     tabs = st.tabs(["Dashboard", "Create New Invoice", "Search Invoice"])
 
     with tabs[0]:
-        st.info("Dashboard is coming soon.")
+        render_dashboard()
 
     with tabs[1]:
         render_create_form()
@@ -645,6 +645,214 @@ def main():
 # ---------------------------
 # UI helpers
 # ---------------------------
+
+def render_dashboard():
+    st.subheader("Dashboard")
+
+    # Light styling for nicer cards/sections
+    st.markdown(
+        """
+        <style>
+        .dash-section h3, .dash-section h4 { margin-top: 0.5rem; }
+        .dash-card { padding: 0.6rem 0.8rem; border: 1px solid #e5e7eb; border-radius: 10px; background: #ffffff; }
+        .dash-muted { color:#6b7280; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Load data for dashboard with broader columns
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT id, customer_name, product, date_of_quotation, quotation_no, pdf_path, created_at
+            FROM invoices
+            ORDER BY id DESC
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if df.empty:
+        st.info("No invoices yet.")
+        return
+
+    # Normalize dates
+    def to_date(x):
+        try:
+            return datetime.strptime(str(x), "%Y-%m-%d").date()
+        except Exception:
+            try:
+                return datetime.fromisoformat(str(x)).date()
+            except Exception:
+                return None
+    df["date_of_quotation"] = df["date_of_quotation"].apply(to_date)
+
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)
+    month_start = today.replace(day=1)
+    # compute month_end
+    if month_start.month == 12:
+        next_month_start = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month_start = month_start.replace(month=month_start.month + 1)
+    month_end = next_month_start - timedelta(days=1)
+
+    # Controls
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        range_opt = st.radio(
+            "Date Range",
+            options=["Today", "Yesterday", "This Week", "This Month", "Custom"],
+            horizontal=True,
+        )
+    with c2:
+        sort_opt = st.selectbox("Sort by Date", options=["Newest first", "Oldest first"], index=0)
+    with c3:
+        # Placeholder for custom date control below
+        pass
+
+    start_date, end_date = None, None
+    if range_opt == "Today":
+        start_date, end_date = today, today
+    elif range_opt == "Yesterday":
+        start_date, end_date = yesterday, yesterday
+    elif range_opt == "This Week":
+        start_date, end_date = week_start, week_end
+    elif range_opt == "This Month":
+        start_date, end_date = month_start, month_end
+    else:
+        # Custom: let user pick a date or date range
+        dr = st.date_input("Select date or range", value=(week_start, week_end))
+        if isinstance(dr, tuple) and len(dr) == 2:
+            start_date, end_date = dr
+        else:
+            start_date = dr
+            end_date = dr
+
+    # Filter
+    df_valid = df.dropna(subset=["date_of_quotation"]).copy()
+    if start_date and end_date:
+        mask = (df_valid["date_of_quotation"] >= start_date) & (df_valid["date_of_quotation"] <= end_date)
+        df_view = df_valid[mask]
+    else:
+        df_view = df_valid
+
+    # Metrics row
+    total_invoices = len(df)
+    # Count rows that have a non-empty pdf_path (fix parentheses to sum the boolean mask)
+    total_with_pdf = int(((df["pdf_path"].notna()) & (df["pdf_path"] != "")).sum()) if "pdf_path" in df.columns else 0
+    selected_count = len(df_view)
+    unique_customers = df["customer_name"].nunique()
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Total Invoices", total_invoices)
+    with m2:
+        st.metric("Invoices in Range", selected_count)
+    with m3:
+        st.metric("Unique Customers", int(unique_customers))
+    with m4:
+        st.metric("With PDF", total_with_pdf)
+
+    # Quick glance mini-counters
+    def count_in(d0, d1):
+        return int(((df_valid["date_of_quotation"] >= d0) & (df_valid["date_of_quotation"] <= d1)).sum())
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        st.caption("Today")
+        st.write(count_in(today, today))
+    with q2:
+        st.caption("Yesterday")
+        st.write(count_in(yesterday, yesterday))
+    with q3:
+        st.caption("This Week")
+        st.write(count_in(week_start, week_end))
+    with q4:
+        st.caption("This Month")
+        st.write(count_in(month_start, month_end))
+
+    # Charts
+    st.markdown("### Charts")
+    ch1, ch2 = st.columns(2)
+    # Invoices by Product (bar)
+    with ch1:
+        st.markdown("#### Invoices by Product")
+        try:
+            prod_counts = (
+                df_view.groupby("product").size().reset_index(name="count").sort_values("count", ascending=False)
+            )
+            if not prod_counts.empty:
+                prod_counts = prod_counts.set_index("product")
+                st.bar_chart(prod_counts["count"])
+            else:
+                st.caption("No data for selected range.")
+        except Exception:
+            st.caption("Unable to render chart.")
+    # Invoices over time (line)
+    with ch2:
+        st.markdown("#### Invoices over Time")
+        try:
+            daily_counts = (
+                df_view.groupby("date_of_quotation").size().reset_index(name="count").sort_values("date_of_quotation")
+            )
+            if not daily_counts.empty:
+                daily_counts = daily_counts.set_index("date_of_quotation")
+                st.line_chart(daily_counts["count"])
+            else:
+                st.caption("No data for selected range.")
+        except Exception:
+            st.caption("Unable to render chart.")
+
+    # Removed Top Customers section as requested
+
+    # Additional: Distribution by Day of Week
+    st.markdown("#### Distribution by Day of Week")
+    try:
+        dts = pd.to_datetime(df_view["date_of_quotation"], errors="coerce")
+        dow = dts.dt.day_name()
+        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        dow_counts = (
+            dow.value_counts().reindex(order).fillna(0).astype(int)
+        )
+        if dow_counts.sum() > 0:
+            st.bar_chart(dow_counts)
+        else:
+            st.caption("No data for selected range.")
+    except Exception:
+        st.caption("Unable to render chart.")
+
+    # Sort and show card view
+    df_cards = df_view.sort_values("date_of_quotation", ascending=(sort_opt == "Oldest first"))
+    st.markdown("### Invoices")
+    if df_cards.empty:
+        st.info("No invoices in the selected range.")
+        return
+
+    for _, r in df_cards.iterrows():
+        with st.container(border=True):
+            top_l, top_r = st.columns([6, 4])
+            with top_l:
+                st.markdown(f"**{r['customer_name']}**")
+                st.caption(f"Quotation No: {r['quotation_no']}")
+            with top_r:
+                st.caption(r.get("product", ""))
+                st.caption(f"Date: {r['date_of_quotation']}")
+
+            # Quick actions (links) – persist query params for Search tab to pick up
+            rid = int(r["id"]) if not pd.isna(r["id"]) else None
+            if rid is not None:
+                link_row = []
+                link_row.append(f"<a href='?action=preview&id={rid}'>Preview in Search</a>")
+                link_row.append(f"<a href='?action=edit&id={rid}'>Edit in Search</a>")
+                if isinstance(r.get("pdf_path"), str) and os.path.exists(r.get("pdf_path")):
+                    fname = os.path.basename(r.get("pdf_path"))
+                    link_row.append(f"<a href='file://{r.get('pdf_path')}' download='{fname}'>Download PDF</a>")
+                st.markdown(" | ".join(link_row), unsafe_allow_html=True)
 
 def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Optional[int] = None):
     conn = get_conn()
