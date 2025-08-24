@@ -57,7 +57,7 @@ PRODUCT_OPTIONS = [
 ]
 
 QUOTATION_PREFIX = "MIERAE/25-26/"
-QUOTATION_START_NUMBER = 1  # corresponds to 0001
+QUOTATION_START_NUMBER = 793  # corresponds to 0001
 
 # ---------------------------
 # Utility: database
