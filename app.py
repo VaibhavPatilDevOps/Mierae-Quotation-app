@@ -56,8 +56,8 @@ PRODUCT_OPTIONS = [
     "5.5 kW Residential Rooftop Solar System",
 ]
 
-QUOTATION_PREFIX = "RRSS/AP/APEPDCL/VSP/"
-QUOTATION_START_NUMBER = 20  # corresponds to 0020
+QUOTATION_PREFIX = "MIERAE/25-26/"
+QUOTATION_START_NUMBER = 1  # corresponds to 0001
 
 # ---------------------------
 # Utility: database
@@ -118,6 +118,244 @@ def ensure_dirs():
     os.makedirs(DOCX_DIR, exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
 
+# ---------------------------
+# Helper: upload PDF to transfer.sh
+# ---------------------------
+
+def _upload_to_transfersh(file_path: str) -> Optional[str]:
+    """Uploads a file to transfer.sh via HTTP PUT and returns the public URL, or None on failure.
+    Uses only stdlib to avoid new dependencies.
+    """
+    try:
+        import urllib.request as _ur
+        filename = os.path.basename(file_path)
+        url = f"https://transfer.sh/{filename}"
+        req = _ur.Request(url, method="PUT")
+        with open(file_path, "rb") as f:
+            data = f.read()
+        req.add_header("Content-Type", "application/octet-stream")
+        req.add_header("Content-Length", str(len(data)))
+        with _ur.urlopen(req, data=data, timeout=60) as resp:
+            body = resp.read().decode().strip()
+            # transfer.sh usually responds with the final URL in the body
+            if body.startswith("http://") or body.startswith("https://"):
+                return body
+            # Fallback to request URL if a 200 with no body URL
+            return url
+    except Exception:
+        return None
+
+
+# ---------------------------
+# Helpers for sharing/public links and mobile share UI
+# ---------------------------
+
+def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Safe accessor for Streamlit secrets. Returns default if missing."""
+    try:
+        import streamlit as _st
+        if hasattr(_st, "secrets") and key in _st.secrets:
+            val = _st.secrets.get(key)
+            return str(val) if val is not None else default
+    except Exception:
+        pass
+
+
+def _render_delete_button(record_id: int, label: str = "Delete") -> None:
+    """Render a red pill 'Delete' button via HTML/JS that triggers deletion using query params.
+    We redirect to the same page with ?delete_id=ID, which is handled in Python to perform deletion.
+    """
+    try:
+        import streamlit.components.v1 as _components
+        btn_html = f"""
+        <div style=\"display:flex; justify-content:center; width:100%\">
+          <button
+            onclick=\"(function(){{ const u=new URL(window.location.href); u.searchParams.set('delete_id','{record_id}'); u.searchParams.set('ts', Date.now()); window.location.href=u.toString(); }})()\"
+            style=\"
+              display:inline-flex; align-items:center; gap:8px;
+              padding: 0.35rem 0.6rem; border-radius:999px;
+              font-size:13px; min-width:36px; height:36px;
+              background:#ef4444; color:#ffffff; border:none; cursor:pointer;
+              box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            \">
+            <span>🗑️</span>
+            <span>{label}</span>
+          </button>
+        </div>
+        """
+        _components.html(btn_html, height=60)
+    except Exception:
+        pass
+
+
+def _handle_delete_via_query() -> None:
+    """Check URL query params for delete_id and delete the record if present."""
+    try:
+        import streamlit as _st
+        del_id = _st.query_params.get("delete_id")
+        if del_id:
+            try:
+                rid = int(del_id if isinstance(del_id, str) else del_id[0])
+                delete_invoice(rid)
+                _st.success("Deleted.")
+            except Exception as e:
+                _st.error(f"Failed to delete: {e}")
+            finally:
+                # Clear the param and rerun to refresh the list
+                try:
+                    _st.query_params.clear()
+                except Exception:
+                    pass
+                _st.rerun()
+    except Exception:
+        pass
+
+
+
+def _upload_to_fileio(file_path: str) -> Optional[str]:
+    """Upload a file to file.io and return a public URL. Uses stdlib only.
+    Note: file.io links may expire by default. This is a best-effort fallback.
+    """
+    try:
+        import os as _os
+        import json as _json
+        import uuid as _uuid
+        import urllib.request as _ur
+
+        boundary = f"----WebKitFormBoundary{_uuid.uuid4().hex}"
+        filename = _os.path.basename(file_path)
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        # Build multipart/form-data body
+        parts = []
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            (
+                f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode()
+        )
+        parts.append(file_bytes)
+        parts.append("\r\n".encode())
+        # Optional: set maxDownloads=1 or expiry; we omit to keep default
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+
+        req = _ur.Request("https://file.io")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        req.add_header("Content-Length", str(len(body)))
+        with _ur.urlopen(req, data=body, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            try:
+                data = _json.loads(raw)
+                url = data.get("link") or data.get("url") or data.get("success")
+                if isinstance(url, str) and (url.startswith("http://") or url.startswith("https://")):
+                    return url
+            except Exception:
+                # Some responses are plain text URL
+                if raw.startswith("http://") or raw.startswith("https://"):
+                    return raw.strip()
+        return None
+    except Exception:
+        return None
+
+
+def _get_public_link(file_path: str) -> Optional[str]:
+    """Return a cached public URL for the file, uploading if needed.
+    Tries transfer.sh first, falls back to file.io. Caches by absolute path.
+    """
+    try:
+        import os as _os
+        import streamlit as _st
+        key = f"public_url::{_os.path.abspath(file_path)}"
+        cached = _st.session_state.get(key)
+        if cached:
+            return cached
+        # Try transfer.sh
+        url = _upload_to_transfersh(file_path)
+        if not url:
+            url = _upload_to_fileio(file_path)
+        if url:
+            _st.session_state[key] = url
+        return url
+    except Exception:
+        return None
+
+
+def _render_mobile_share_button(pdf_path: str, filename: Optional[str] = None) -> None:
+    """Render a mobile-friendly Share button that shares the actual PDF file via Web Share API.
+    Falls back to a normal download link if file sharing is not supported.
+    """
+    try:
+        import os as _os
+        import base64 as _b64
+        import streamlit as _st
+        import streamlit.components.v1 as _components
+
+        if not (pdf_path and _os.path.exists(pdf_path)):
+            _st.warning("PDF not found for sharing.")
+            return
+        name = filename or _os.path.basename(pdf_path) or "invoice.pdf"
+        with open(pdf_path, "rb") as f:
+            b64 = _b64.b64encode(f.read()).decode("utf-8")
+
+        html = f"""
+        <div style="display:flex; justify-content:center; width:100%">
+          <button id="sharePdfBtn" aria-label="Share PDF"
+                  style="
+                    display:inline-flex; align-items:center; gap:8px;
+                    padding: 0.35rem 0.6rem; border-radius:999px;
+                    font-size:13px; min-width:36px; height:36px;
+                    background:#10b981; color:#ffffff; border:none; cursor:pointer;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+                  ">
+            <span>📤</span>
+            <span>Share PDF</span>
+          </button>
+          <a id="dlLink" download="{name}" href="data:application/pdf;base64,{b64}" style="display:none">Download</a>
+        </div>
+        <script>
+        (function() {{
+          const btn = document.getElementById('sharePdfBtn');
+          const dl = document.getElementById('dlLink');
+          const b64 = "{b64}";
+          const fname = "{name}";
+          function b64ToBytes(b64) {{
+            const bin = atob(b64);
+            const len = bin.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+            return bytes;
+          }}
+          btn.addEventListener('click', async () => {{
+            try {{
+              const bytes = b64ToBytes(b64);
+              const blob = new Blob([bytes], {{ type: 'application/pdf' }});
+              const file = new File([blob], fname, {{ type: 'application/pdf' }});
+              if (navigator.canShare && navigator.canShare({{ files: [file] }})) {{
+                await navigator.share({{
+                  files: [file],
+                  title: fname,
+                  text: 'Invoice PDF'
+                }});
+              }} else {{
+                // Fallback: trigger download so user can attach from gallery/files
+                dl.click();
+              }}
+            }} catch (e) {{
+              console.error(e);
+              dl.click();
+            }}
+          }});
+        }})();
+        </script>
+        """
+        _components.html(html, height=60)
+    except Exception:
+        # Quietly ignore; UI fallback handled elsewhere
+        pass
+
 
 def safe_filename(name: str) -> str:
     """Return a filesystem-safe filename fragment (no path separators or illegal chars)."""
@@ -128,6 +366,52 @@ def safe_filename(name: str) -> str:
     # Collapse spaces and trim
     safe = " ".join(safe.split())
     return safe
+
+# ---------------------------
+# Helper: WhatsApp Cloud API send (optional)
+# ---------------------------
+
+def _wa_send_document_via_cloud_api(
+    phone_number: str,
+    doc_link: str,
+    filename: str,
+    caption: str,
+    token: str,
+    phone_number_id: str,
+) -> Tuple[bool, str]:
+    """Send a document message using WhatsApp Cloud API. Returns (ok, msg)."""
+    try:
+        import json as _json
+        import urllib.request as _ur
+        import urllib.error as _ue
+
+        url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone_number,
+            "type": "document",
+            "document": {
+                "link": doc_link,
+                "filename": filename,
+                "caption": caption or "",
+            },
+        }
+        data = _json.dumps(payload).encode("utf-8")
+        req = _ur.Request(url, data=data, method="POST")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with _ur.urlopen(req, timeout=60) as resp:
+                _ = resp.read()
+                return True, "Sent via WhatsApp API."
+        except _ue.HTTPError as e:
+            try:
+                err_body = e.read().decode()
+            except Exception:
+                err_body = str(e)
+            return False, f"API error: {err_body}"
+    except Exception as ex:
+        return False, f"Failed: {ex}"
 
 # ---------------------------
 # DOCX processing - replace only yellow highlighted runs
@@ -671,7 +955,7 @@ def load_invoices() -> pd.DataFrame:
     conn = get_conn()
     try:
         df = pd.read_sql_query(
-            "SELECT id, customer_name, product, date_of_quotation, quotation_no, docx_path, pdf_path FROM invoices ORDER BY id DESC",
+            "SELECT id, customer_name, mobile, product, date_of_quotation, quotation_no, docx_path, pdf_path FROM invoices ORDER BY id DESC",
             conn,
         )
     finally:
@@ -1068,10 +1352,23 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
                 st.success("Invoice updated successfully.")
                 st.toast("Invoice updated", icon="✏️")
             if pdf_path and os.path.exists(pdf_path):
-                with open(pdf_path, "rb") as f:
-                    prog.progress(90, text="Preparing download…")
-                    st.download_button("Download PDF", data=f.read(), file_name=os.path.basename(pdf_path), mime="application/pdf")
-                    prog.progress(100, text="Done")
+                # Inline preview of the generated PDF
+                _render_pdf_preview(pdf_path, height=480)
+                # Actions: Download + Share side-by-side
+                cdl, csh = st.columns([1, 1])
+                with cdl:
+                    with open(pdf_path, "rb") as f:
+                        prog.progress(90, text="Preparing download…")
+                        st.download_button(
+                            "⬇️  Download",
+                            data=f.read(),
+                            file_name=os.path.basename(pdf_path),
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                with csh:
+                    _render_mobile_share_button(pdf_path, os.path.basename(pdf_path))
+                prog.progress(100, text="Done")
             else:
                 prog.progress(100, text="Completed (PDF unavailable)")
                 st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word installed.")
@@ -1082,6 +1379,8 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
 
 def render_search_tab():
     st.subheader("Search Invoice")
+    # Process delete action if triggered via query param
+    _handle_delete_via_query()
 
     df = load_invoices()
     if df.empty:
@@ -1093,15 +1392,15 @@ def render_search_tab():
     with c1:
         f_name = st.text_input("Filter by Customer Name")
     with c2:
-        f_qno = st.text_input("Filter by Quotation No")
+        f_mobile = st.text_input("Filter by Mobile Number")
     with c3:
         f_product = st.selectbox("Filter by Product", options=["All"] + PRODUCT_OPTIONS, index=0)
 
     mask = pd.Series([True] * len(df))
     if f_name:
         mask &= df["customer_name"].str.contains(f_name, case=False, na=False)
-    if f_qno:
-        mask &= df["quotation_no"].str.contains(f_qno, case=False, na=False)
+    if f_mobile:
+        mask &= df["mobile"].astype(str).str.contains(f_mobile, case=False, na=False)
     if f_product != "All":
         mask &= df["product"] == f_product
 
@@ -1194,7 +1493,7 @@ def render_search_tab():
                     )
                 # Actions: force single horizontal row using 4 columns
                 rid = int(row["id"])
-                a1, a2, a3, a4 = st.columns([1, 1, 1, 1])
+                a1, a2, a3, a4, a5 = st.columns([1, 1, 1, 1, 1])
                 with a1:
                     if st.button("👁️  Preview", key=f"m_prev_{rid}", use_container_width=True):
                         st.session_state["preview_id"] = rid
@@ -1220,9 +1519,15 @@ def render_search_tab():
                         st.session_state["selected_edit_id"] = rid
                         st.session_state.pop("preview_id", None)
                 with a4:
+                    if pdf_path and os.path.exists(pdf_path):
+                        _render_mobile_share_button(pdf_path, os.path.basename(pdf_path))
+                    else:
+                        st.button("Share PDF", disabled=True, key=f"m_share_na_{rid}", use_container_width=True)
+                with a5:
                     if st.button("🗑️  Delete", key=f"m_del_{rid}", use_container_width=True):
                         delete_invoice(rid)
                         st.success("Deleted.")
+                        st.rerun()
 
                 # Compact details with View more (show all key fields)
                 with st.expander("View details", expanded=False):
@@ -1247,6 +1552,8 @@ def render_search_tab():
                     if st.button("Close preview", key=f"m_close_prev_{row['id']}"):
                         st.session_state.pop("preview_id", None)
                         st.rerun()
+
+                # Inline share prompt removed; Share PDF button is now directly in the action row
 
                 # Inline Edit panel (only for the selected card)
                 if st.session_state.get("selected_edit_id") == int(row["id"]):
@@ -1289,7 +1596,7 @@ def render_search_tab():
         with c4:
             st.write(row["quotation_no"]) 
         with c5:
-            a1, a2, a3, a4 = st.columns([1, 1, 1, 1])
+            a1, a2, a3, a4, a5 = st.columns([1, 1, 1, 1, 1])
             with a1:
                 if st.button("👁️", key=f"d_prev_{rid}", use_container_width=True):
                     st.session_state["preview_id"] = rid
@@ -1306,6 +1613,11 @@ def render_search_tab():
                     st.session_state.pop("preview_id", None)
                     st.rerun()
             with a4:
+                if pdf_path and os.path.exists(pdf_path):
+                    _render_mobile_share_button(pdf_path, os.path.basename(pdf_path))
+                else:
+                    st.button("Share PDF", disabled=True, key=f"d_share_na_{rid}", use_container_width=True)
+            with a5:
                 if st.button("🗑️", key=f"d_del_{rid}", use_container_width=True):
                     delete_invoice(rid)
                     st.success("Deleted.")
@@ -1318,6 +1630,8 @@ def render_search_tab():
                 if st.button("Close preview", key=f"d_close_preview_{rid}"):
                     st.session_state.pop("preview_id", None)
                     st.rerun()
+
+        # Inline share prompt removed; Share PDF is now directly in the action row (desktop view)
 
         # Inline edit panel right under the targeted row (desktop view), same as mobile behavior
         if st.session_state.get("selected_edit_id") == rid:
