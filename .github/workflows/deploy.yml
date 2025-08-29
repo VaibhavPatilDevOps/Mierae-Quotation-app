@@ -1,0 +1,44 @@
+name: Deploy API to EC2 via ECR
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1 # Change to your AWS region
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}
+
+      - name: Build and Push Docker Image
+        run: |
+          IMAGE_TAG=mieraeqoutation  # Or use `echo $GITHUB_SHA`
+          docker build -t ${{ secrets.AWS_ECR_REGISTRY }}:$IMAGE_TAG .
+          docker push ${{ secrets.AWS_ECR_REGISTRY }}:$IMAGE_TAG
+
+      - name: Deploy to EC2 via SSH
+        run: |
+          echo "${{ secrets.PRODUCTION_SSH }}" > ec2_key.pem
+          chmod 600 ec2_key.pem  # Set correct permissions for the SSH key
+
+          ssh -o StrictHostKeyChecking=no -i ec2_key.pem ${{ secrets.EC2_USER }}@${{ secrets.PRODUCTION_HOST }} << 'EOF'
+            IMAGE_TAG=mieraeqoutation  # Ensure same tag is used
+            
+            # Run deployment script
+            sudo chmod +x /home/ubuntu/scripts/mieraeqoutation.sh
+            sh /home/ubuntu/scripts/mieraeqoutation.sh
+          EOF
