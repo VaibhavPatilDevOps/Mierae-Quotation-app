@@ -1,4 +1,4 @@
-name: Deploy python API to EC2 via ECR repo..
+name: Deploy python API to EC2 via ECR repo...
 
 on:
   push:
