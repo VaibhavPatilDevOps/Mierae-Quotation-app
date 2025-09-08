@@ -27,6 +27,7 @@ from docx2pdf import convert as docx2pdf_convert
 APP_TITLE = "Mierae Invoice/Quotation Manager"
 DB_PATH = os.path.join(os.getcwd(), "invoices.db")
 TEMPLATE_PATH = os.path.join(os.getcwd(), "Mierae Quotation Template new.docx")
+TEMPLATE_PATH_55 = os.path.join(os.getcwd(), "mierae quotation 5.4.docx")
 OUTPUT_DIR = os.path.join(os.getcwd(), "output")
 DOCX_DIR = os.path.join(OUTPUT_DIR, "docx")
 PDF_DIR = os.path.join(OUTPUT_DIR, "pdf")
@@ -637,7 +638,15 @@ def clear_all_highlights(doc: DocxDocument) -> None:
 # Core required functions
 # ---------------------------
 
-def create_invoice(form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+def _template_for_product(product: str) -> str:
+    """Return the template path based on selected product."""
+    pl = (product or "").lower()
+    if "5.5" in pl:
+        return TEMPLATE_PATH_55
+    # default to 3.3 template
+    return TEMPLATE_PATH
+
+def create_invoice(form_data: Dict[str, str], template_path: str) -> Tuple[Optional[str], Optional[str]]:
     """Create invoice: generate DOCX (temporary), convert to PDF, save DB record.
     Returns (None, pdf_path or None if conversion failed). We no longer persist DOCX files.
     """
@@ -664,11 +673,11 @@ def create_invoice(form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[s
             form_data.get("validity_date", ""),
         ]
 
-        docx_bytes = generate_docx(values, form_data)
+        docx_bytes = generate_docx(values, form_data, template_path)
         # Save DOCX temporarily (needed for conversion) – will delete after PDF is created
-        safe_customer = safe_filename(form_data["customer_name"]) if form_data.get("customer_name") else "customer"
+        # Use only Quotation No for file naming so one quotation -> one PDF file consistently
         safe_qno = safe_filename(form_data["quotation_no"]) if form_data.get("quotation_no") else "qno"
-        base_name = f"{safe_customer.strip()}+{safe_qno}"
+        base_name = f"{safe_qno}"
         docx_path = os.path.join(DOCX_DIR, f"{base_name}.docx")
         # Safe overwrite if file exists
         try:
@@ -688,7 +697,7 @@ def create_invoice(form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[s
             pass
         pdf_path = convert_to_pdf(docx_path, target_pdf)
 
-        # Delete the temporary DOCX and do not store it
+        # Always delete temporary DOCX (do not persist word files)
         try:
             if os.path.exists(docx_path):
                 os.remove(docx_path)
@@ -755,10 +764,10 @@ def _render_pdf_preview(pdf_path: str, height: int = 700) -> None:
         st.warning("Preview not available.")
 
 
-def generate_docx(values_in_order: List[str], form_data: Dict[str, str]) -> io.BytesIO:
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError(f"Template not found at {TEMPLATE_PATH}")
-    doc = Document(TEMPLATE_PATH)
+def generate_docx(values_in_order: List[str], form_data: Dict[str, str], template_path: str) -> io.BytesIO:
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Template not found at {template_path}")
+    doc = Document(template_path)
 
     # Replace values by labels for accuracy
     replace_by_labels(doc, form_data)
@@ -864,9 +873,20 @@ def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
     except Exception:
         pass
 
-    # 1) Try LibreOffice (fast, headless) if available (works on Linux/Streamlit Cloud)
+    # 1) Try LibreOffice (fast, headless) if available (works on Linux/Streamlit Cloud and Windows if installed)
     try:
+        # Try PATH first
         soffice = shutil.which("soffice") or shutil.which("soffice.exe")
+        # Allow overriding via environment variable
+        if not soffice:
+            env_lo = os.environ.get("LIBREOFFICE_PATH")
+            if env_lo and os.path.exists(env_lo):
+                soffice = env_lo
+        # Try common Windows install path
+        if not soffice:
+            win_lo = r"C:\\Program Files\\LibreOffice\\program\\soffice.exe"
+            if os.path.exists(win_lo):
+                soffice = win_lo
         if soffice and os.path.exists(docx_path):
             outdir = os.path.dirname(target_pdf_path)
             cmd = [
@@ -895,10 +915,30 @@ def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
 
     # 2) Fallback: Word via docx2pdf (Windows only)
     try:
-        docx2pdf_convert(docx_path, target_pdf_path)
-        return target_pdf_path if os.path.exists(target_pdf_path) else None
+        src = os.path.abspath(docx_path)
+        dst = os.path.abspath(target_pdf_path)
+        # Try file-to-file
+        docx2pdf_convert(src, dst)
+        if os.path.exists(dst):
+            return dst
+        # Try file-to-directory (docx2pdf will name the PDF same as DOCX base)
+        outdir = os.path.dirname(dst)
+        os.makedirs(outdir, exist_ok=True)
+        docx2pdf_convert(src, outdir)
+        produced = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if os.path.exists(produced):
+            # Move/rename to target path if needed
+            if os.path.abspath(produced) != os.path.abspath(dst):
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                except Exception:
+                    pass
+                os.replace(produced, dst)
+            return dst
     except Exception:
-        return None
+        pass
+    return None
 
 
 def save_to_db(conn: sqlite3.Connection, record: Dict[str, str]) -> None:
@@ -967,20 +1007,20 @@ def delete_invoice(inv_id: int) -> None:
         conn.close()
 
 
-def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+def edit_invoice(inv_id: int, form_data: Dict[str, str], template_path: str) -> Tuple[Optional[str], Optional[str]]:
     """Update record and regenerate files. Returns (None, pdf_path).
     We no longer persist DOCX files; use temporary DOCX for conversion only.
     """
     ensure_dirs()
     conn = get_conn()
     try:
-        # Fetch existing quotation_no to keep it stable
+        # Fetch existing quotation_no and existing file paths to keep it stable and replace old PDF
         cur = conn.cursor()
-        cur.execute("SELECT quotation_no, docx_path FROM invoices WHERE id = ?", (inv_id,))
+        cur.execute("SELECT quotation_no, docx_path, pdf_path FROM invoices WHERE id = ?", (inv_id,))
         row = cur.fetchone()
         if not row:
             raise ValueError("Invoice not found")
-        quotation_no, old_docx_path = row[0], row[1]
+        quotation_no, old_docx_path, old_pdf_path = row[0], row[1], row[2]
         form_data = dict(form_data)
         form_data["quotation_no"] = quotation_no
 
@@ -996,18 +1036,18 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[Optional[str],
             form_data.get("date_of_quotation", ""),
             form_data.get("validity_date", ""),
         ]
-        docx_bytes = generate_docx(values, form_data)
+        docx_bytes = generate_docx(values, form_data, template_path)
 
-        safe_customer = safe_filename(form_data["customer_name"]) if form_data.get("customer_name") else "customer"
+        # Use only Quotation No for file naming so one quotation -> one PDF file
         safe_qno = safe_filename(form_data["quotation_no"]) if form_data.get("quotation_no") else "qno"
-        base_name = f"{safe_customer.strip()}+{safe_qno}"
+        base_name = f"{safe_qno}"
         temp_docx_path = os.path.join(DOCX_DIR, f"{base_name}.docx")
         with open(temp_docx_path, "wb") as f:
             f.write(docx_bytes.getvalue())
 
         pdf_path = convert_to_pdf(temp_docx_path, os.path.join(PDF_DIR, f"{base_name}.pdf"))
 
-        # Delete temporary docx and any previously stored docx
+        # Always delete temporary DOCX and remove any previously stored DOCX
         try:
             if os.path.exists(temp_docx_path):
                 os.remove(temp_docx_path)
@@ -1016,6 +1056,14 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str]) -> Tuple[Optional[str],
         try:
             if old_docx_path and os.path.exists(old_docx_path):
                 os.remove(old_docx_path)
+        except Exception:
+            pass
+
+        # If previous PDF exists and path differs from new target, delete it
+        target_pdf_path = os.path.join(PDF_DIR, f"{base_name}.pdf")
+        try:
+            if old_pdf_path and os.path.exists(old_pdf_path) and os.path.abspath(old_pdf_path) != os.path.abspath(target_pdf_path):
+                os.remove(old_pdf_path)
         except Exception:
             pass
 
@@ -1060,13 +1108,34 @@ def main():
     ensure_dirs()
     _ = get_conn()  # ensure DB exists
 
-    tabs = st.tabs(["Dashboard", "Create New Invoice", "Search Invoice"])
+    tabs = st.tabs(["Dashboard", "Create Invoice", "Search Invoice"])
 
     with tabs[0]:
         render_dashboard()
 
+    # with tabs[1]:
+    #     # Create (3.3 kW) – restrict to only 3.3 product and use 3.3 template
+    #     render_create_form(
+    #         allowed_products=["3.3 kW Residential Rooftop Solar System"],
+    #         form_title="Create Invoice (3.3 kW)",
+    #         key_ns="kw33",
+    #     )
+
+    # with tabs[2]:
+    #     # Create (5.5 kW) – restrict to only 5.5 product and use 5.5 template
+    #     render_create_form(
+    #         allowed_products=["5.5 kW Residential Rooftop Solar System"],
+    #         form_title="Create Invoice (5.5 kW)",
+    #         key_ns="kw55",
+    #     )
+
     with tabs[1]:
-        render_create_form()
+        # Create (Both) – allow choosing either product; template auto-selected
+        render_create_form(
+            allowed_products=PRODUCT_OPTIONS,
+            form_title="Create Invoice",
+            key_ns="kwall",
+        )
 
     with tabs[2]:
         render_search_tab()
@@ -1258,46 +1327,79 @@ def render_dashboard():
 
     # Invoices section intentionally removed
 
-def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Optional[int] = None):
+def render_create_form(
+    prefill: Optional[Dict[str, str]] = None,
+    edit_id: Optional[int] = None,
+    allowed_products: Optional[List[str]] = None,
+    form_title: Optional[str] = None,
+    key_ns: Optional[str] = None,
+):
     conn = get_conn()
     try:
         qno_preview = next_quotation_no(conn) if edit_id is None else None
     finally:
         conn.close()
 
-    st.subheader("Create New Invoice" if edit_id is None else "Edit Invoice")
+    # establish a namespace for widget keys to avoid collisions across tabs/forms
+    ns = key_ns or (f"edit_{edit_id}" if edit_id is not None else "new")
 
-    # Date of Quotation & Validity outside the form so validity updates immediately when date changes
-    date_default = datetime.now().date()
-    if prefill and prefill.get("date_of_quotation"):
+    if edit_id is None:
+        st.subheader(form_title or "Create New Invoice")
+    else:
+        st.subheader("Edit Invoice")
+
+    # Date of Quotation & Validity
+    # Create mode: allow picking date; Edit mode: lock and use stored values
+    if edit_id is None:
+        date_default = datetime.now().date()
+        if prefill and prefill.get("date_of_quotation"):
+            try:
+                date_default = datetime.strptime(prefill["date_of_quotation"], "%Y-%m-%d").date()
+            except Exception:
+                pass
+        date_of_quotation = st.date_input(
+            "Date of Quotation",
+            value=date_default,
+            key=f"{ns}_doq",
+        )
+        validity_date = date_of_quotation + timedelta(days=30)
+    else:
+        # Parse existing values to date objects for consistent downstream formatting
+        doq_str = (prefill.get("date_of_quotation") if prefill else None) or datetime.now().date().isoformat()
         try:
-            date_default = datetime.strptime(prefill["date_of_quotation"], "%Y-%m-%d").date()
+            date_of_quotation = datetime.strptime(str(doq_str), "%Y-%m-%d").date()
         except Exception:
-            pass
-    date_of_quotation = st.date_input(
-        "Date of Quotation",
-        value=date_default,
-        key=f"doq_{edit_id or 'new'}",
-    )
-    validity_date = date_of_quotation + timedelta(days=30)
+            date_of_quotation = datetime.now().date()
+        val_str = (prefill.get("validity_date") if prefill else None)
+        if val_str:
+            try:
+                validity_date = datetime.strptime(str(val_str), "%Y-%m-%d").date()
+            except Exception:
+                validity_date = date_of_quotation + timedelta(days=30)
+        else:
+            validity_date = date_of_quotation + timedelta(days=30)
 
-    with st.form(key=f"invoice_form_{edit_id or 'new'}"):
-        product = st.selectbox("Product & Service", options=PRODUCT_OPTIONS, index=(PRODUCT_OPTIONS.index(prefill.get("product")) if prefill and prefill.get("product") in PRODUCT_OPTIONS else 0))
-        customer_name = st.text_input("Customer Name", value=(prefill.get("customer_name") if prefill else ""))
-        mobile = st.text_input("Mobile Number", value=(prefill.get("mobile") if prefill else ""))
-        location = st.text_input("Location", value=(prefill.get("location") if prefill else ""))
-        city = st.text_input("City", value=(prefill.get("city") if prefill else ""))
-        state = st.text_input("State", value=(prefill.get("state") if prefill else ""))
-        pincode = st.text_input("Pincode", value=(prefill.get("pincode") if prefill else ""))
-        staff_name = st.text_input("Staff Name (kept only in DB)", value=(prefill.get("staff_name") if prefill else ""))
+    with st.form(key=f"{ns}_form"):
+        product_options = allowed_products if allowed_products else PRODUCT_OPTIONS
+        default_index = 0
+        if prefill and prefill.get("product") in product_options:
+            default_index = product_options.index(prefill.get("product"))
+        product = st.selectbox("Product & Service", options=product_options, index=default_index, key=f"{ns}_product")
+        customer_name = st.text_input("Customer Name", value=(prefill.get("customer_name") if prefill else ""), key=f"{ns}_customer")
+        mobile = st.text_input("Mobile Number", value=(prefill.get("mobile") if prefill else ""), key=f"{ns}_mobile")
+        location = st.text_input("Location", value=(prefill.get("location") if prefill else ""), key=f"{ns}_location")
+        city = st.text_input("City", value=(prefill.get("city") if prefill else ""), key=f"{ns}_city")
+        state = st.text_input("State", value=(prefill.get("state") if prefill else ""), key=f"{ns}_state")
+        pincode = st.text_input("Pincode", value=(prefill.get("pincode") if prefill else ""), key=f"{ns}_pincode")
+        staff_name = st.text_input("Staff Name (kept only in DB)", value=(prefill.get("staff_name") if prefill else ""), key=f"{ns}_staff")
         # Show computed values inside the form (read-only)
-        st.text_input("Date of Quotation", value=date_of_quotation.isoformat(), disabled=True)
-        st.text_input("Validity (auto)", value=validity_date.isoformat(), disabled=True)
+        st.text_input("Date of Quotation", value=date_of_quotation.isoformat(), disabled=True, key=f"{ns}_doq_ro")
+        st.text_input("Validity (auto)", value=validity_date.isoformat(), disabled=True, key=f"{ns}_validity_ro")
 
         if edit_id is None and qno_preview:
-            st.text_input("Quotation No (auto)", value=qno_preview, disabled=True)
+            st.text_input("Quotation No (auto)", value=qno_preview, disabled=True, key=f"{ns}_qno_preview")
         elif edit_id is not None and prefill and prefill.get("quotation_no"):
-            st.text_input("Quotation No", value=prefill.get("quotation_no"), disabled=True)
+            st.text_input("Quotation No", value=prefill.get("quotation_no"), disabled=True, key=f"{ns}_qno_edit")
 
         submit_label = "Update Invoice" if edit_id is not None else "Create Invoice"
         submitted = st.form_submit_button(submit_label)
@@ -1321,13 +1423,15 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
         try:
             prog.progress(10, text="Processing invoice…")
             status.write("Generating files…")
+            # choose template based on selected product
+            template_path = _template_for_product(product)
             if edit_id is None:
-                docx_path, pdf_path = create_invoice(data)
+                docx_path, pdf_path = create_invoice(data, template_path)
                 prog.progress(70, text="Finalizing creation…")
                 st.success("Invoice created successfully.")
                 st.toast(f"Saved invoice {qno_preview}", icon="✅")
             else:
-                docx_path, pdf_path = edit_invoice(edit_id, data)
+                docx_path, pdf_path = edit_invoice(edit_id, data, template_path)
                 prog.progress(70, text="Finalizing update…")
                 st.success("Invoice updated successfully.")
                 st.toast("Invoice updated", icon="✏️")
@@ -1351,7 +1455,19 @@ def render_create_form(prefill: Optional[Dict[str, str]] = None, edit_id: Option
                 prog.progress(100, text="Done")
             else:
                 prog.progress(100, text="Completed (PDF unavailable)")
-                st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word installed.")
+                if docx_path and isinstance(docx_path, str) and os.path.exists(docx_path):
+                    st.warning("PDF conversion failed. Download the DOCX and export to PDF using Word/LibreOffice. You can also install LibreOffice or MS Word to enable automatic PDF generation.")
+                    with open(docx_path, "rb") as f:
+                        st.download_button(
+                            "⬇️  Download DOCX",
+                            data=f.read(),
+                            file_name=os.path.basename(docx_path),
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+                    st.caption("Tip: On Windows, installing MS Word usually enables automatic PDF conversion via docx2pdf. Alternatively, install LibreOffice and set environment variable LIBREOFFICE_PATH to the soffice.exe.")
+                else:
+                    st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word or LibreOffice installed.")
         except Exception as e:
             prog.progress(100, text="Failed")
             st.error(f"Failed to process invoice: {e}")
