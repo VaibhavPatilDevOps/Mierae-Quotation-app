@@ -1741,95 +1741,103 @@ def _save_uploaded_pdf(uploaded_file, dest_dir: str, base_name: str) -> Optional
 
 
 def _extract_feasibility_fields(pdf_path: str) -> Dict[str, str]:
-    """Extract Date, Name, Mobile No, and Address from feasibility PDF"""
-    try:
-        import pdfplumber
-        import re
-        
-        with pdfplumber.open(pdf_path) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-        
-        # Extract fields using patterns based on the template structure
-        extracted = {"Date": "", "Name": "", "Number": "", "Address": ""}
-        
-        # Date pattern - look for date formats
+    """Extract Date, Name, Mobile No, and Address from feasibility PDF.
+    Tries pdfplumber first; falls back to pypdf if pdfplumber is unavailable on server.
+    """
+    import re
+
+    def _extract_with_regex(full_text: str) -> Dict[str, str]:
+        extracted: Dict[str, str] = {"Date": "", "Name": "", "Number": "", "Address": ""}
+        # Date patterns
         date_patterns = [
             r"Date[:\s]*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})",
             r"Date[:\s]*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2})",
             r"([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})",
         ]
         for pattern in date_patterns:
-            match = re.search(pattern, full_text, re.IGNORECASE)
-            if match:
-                extracted["Date"] = match.group(1).strip()
+            m = re.search(pattern, full_text, re.IGNORECASE)
+            if m:
+                extracted["Date"] = m.group(1).strip()
                 break
-        
-        # Name pattern - look for "Name of Applicant" or similar
+
+        # Name
         name_patterns = [
             r"Name of Applicant[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
             r"Applicant[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
             r"Name[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
         ]
         for pattern in name_patterns:
-            match = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                name = match.group(1).strip()
-                # Clean up common artifacts
-                name = re.sub(r'[^A-Za-z\s]', '', name).strip()
-                if len(name) > 2:  # Valid name should be more than 2 chars
+            m = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
+            if m:
+                name = re.sub(r"[^A-Za-z\s]", "", m.group(1)).strip()
+                if len(name) > 2:
                     extracted["Name"] = name
                     break
-        
-        # Mobile number pattern
+
+        # Mobile
         mobile_patterns = [
             r"Mobile No[:\s]*([0-9]{10,12})",
             r"Mobile[:\s]*([0-9]{10,12})",
             r"Phone[:\s]*([0-9]{10,12})",
-            r"([0-9]{10})",  # 10 digit number
+            r"([0-9]{10})",
         ]
         for pattern in mobile_patterns:
-            match = re.search(pattern, full_text, re.IGNORECASE)
-            if match:
-                extracted["Number"] = match.group(1).strip()
+            m = re.search(pattern, full_text, re.IGNORECASE)
+            if m:
+                extracted["Number"] = m.group(1).strip()
                 break
-        
-        # Address pattern - extract only the highlighted yellow part
-        # Look for the specific format in the template: address, district, state, PIN
+
+        # Address
         address_patterns = [
-            # Pattern for the exact format: "1-180MARRIPADUMARRIPADUTEKKAI, District: Srikakulam, State: ANDHRA PRADESH, PIN Code: 532211"
             r"([A-Za-z0-9\-,\s]+),\s*District:\s*([A-Za-z\s]+),\s*State:\s*([A-Z\s]+),\s*PIN\s*Code:\s*([0-9]+)",
-            # Fallback: just the first line after "Address of Premises for Installation:"
             r"Address of Premises for Installation[:\s]*\n?\s*([^\n]+)",
-            # Another fallback for simpler address format
             r"Installation[:\s]*\n?\s*([A-Za-z0-9\-,\s]+(?:,\s*[A-Za-z\s]+)*)",
         ]
-        
         for pattern in address_patterns:
-            match = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                if len(match.groups()) == 4:  # Full format match
-                    # Combine all parts: address, district, state, PIN
-                    address = f"{match.group(1).strip()}, District: {match.group(2).strip()}, State: {match.group(3).strip()}, PIN Code: {match.group(4).strip()}"
+            m = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
+            if m:
+                if len(m.groups()) == 4:
+                    address = f"{m.group(1).strip()}, District: {m.group(2).strip()}, State: {m.group(3).strip()}, PIN Code: {m.group(4).strip()}"
                 else:
-                    address = match.group(1).strip()
-                
-                # Clean up the address
-                address = re.sub(r'\s+', ' ', address)  # Multiple spaces to single
-                # Keep only essential characters for address
-                address = re.sub(r'[^A-Za-z0-9\s,.:-]', '', address)
-                
-                if len(address) > 5:  # Valid address should be substantial
+                    address = m.group(1).strip()
+                address = re.sub(r"\s+", " ", address)
+                address = re.sub(r"[^A-Za-z0-9\s,.:-]", "", address)
+                if len(address) > 5:
                     extracted["Address"] = address
                     break
-        
         return extracted
+
+    # Try pdfplumber first
+    try:
+        import pdfplumber  # type: ignore
+        full_text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                if t:
+                    full_text += t + "\n"
+        if full_text.strip():
+            return _extract_with_regex(full_text)
     except Exception as e:
-        print(f"Error extracting fields: {e}")
-        return {"Date": "", "Name": "", "Number": "", "Address": ""}
+        print(f"pdfplumber unavailable/failed: {e}")
+
+    # Fallback: pypdf
+    try:
+        from pypdf import PdfReader  # type: ignore
+        reader = PdfReader(pdf_path)
+        texts: List[str] = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                pass
+        full_text = "\n".join(texts)
+        if full_text.strip():
+            return _extract_with_regex(full_text)
+    except Exception as e:
+        print(f"pypdf fallback failed: {e}")
+
+    return {"Date": "", "Name": "", "Number": "", "Address": ""}
 
 
 def _generate_agreement_docx(data: Dict[str, str]) -> io.BytesIO:
@@ -1898,6 +1906,16 @@ def render_feasibility_upload_tab() -> None:
 
     # Extract fields automatically from PDF
     extracted = _extract_feasibility_fields(feas_path)
+    # Diagnostics: show which extractor is active
+    try:
+        import pdfplumber as _pp  # noqa: F401
+        st.caption("Extractor: pdfplumber")
+    except Exception:
+        try:
+            from pypdf import PdfReader  # noqa: F401
+            st.caption("Extractor: pypdf fallback")
+        except Exception:
+            st.caption("Extractor: unavailable (no pdfplumber/pypdf)")
     
     # Show extracted values (read-only display)
     if any(extracted.values()):
