@@ -1,11 +1,13 @@
 import os
 import io
+import re
 import base64
 import sqlite3
 import subprocess
 import shutil
 import sys
 import importlib
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 import streamlit as st
@@ -20,6 +22,10 @@ from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from docx.shared import Inches
 from docx2pdf import convert as docx2pdf_convert
+try:
+    import pdfplumber  # type: ignore
+except Exception:
+    pdfplumber = None
 
 # ---------------------------
 # Constants and configuration
@@ -31,6 +37,14 @@ TEMPLATE_PATH_55 = os.path.join(os.getcwd(), "mierae quotation 5.4.docx")
 OUTPUT_DIR = os.path.join(os.getcwd(), "output")
 DOCX_DIR = os.path.join(OUTPUT_DIR, "docx")
 PDF_DIR = os.path.join(OUTPUT_DIR, "pdf")
+AGREEMENTS_DIR = os.path.join(OUTPUT_DIR, "agreements")
+FEASIBILITY_DIR = os.path.join(OUTPUT_DIR, "feasibility")
+TEMPLATE_AGREEMENT_PATH = os.path.join(os.getcwd(), "templates", "agreement template.docx")
+# Try multiple feasibility template names
+TEMPLATE_FEASIBILITY_NAMES = [
+    os.path.join(os.getcwd(), "templates", "Approval of feasibility template.pdf"),
+    os.path.join(os.getcwd(), "templates", "_Approval of feasibility.pdf"),
+]
 
 PRODUCT_OPTIONS = [
     "3.3 kW Residential Rooftop Solar System",
@@ -39,6 +53,10 @@ PRODUCT_OPTIONS = [
 
 QUOTATION_PREFIX = "MIERAE/25-26/"
 QUOTATION_START_NUMBER = 793  # corresponds to 0001
+
+# Agreements numbering
+AGREEMENT_PREFIX = "AGR/25-26/"
+AGREEMENT_START_NUMBER = 1
 
 # ---------------------------
 # Utility: database
@@ -68,6 +86,23 @@ def get_conn() -> sqlite3.Connection:
         )
         """
     )
+    # Agreements table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agreements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agreement_no TEXT UNIQUE NOT NULL,
+            customer_name TEXT,
+            mobile TEXT,
+            address TEXT,
+            date TEXT,
+            feasibility_path TEXT,
+            agreement_pdf_path TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
     return conn
 
 # ---------------------------
@@ -91,6 +126,24 @@ def next_quotation_no(conn: sqlite3.Connection) -> str:
         nxt = QUOTATION_START_NUMBER
     return f"{QUOTATION_PREFIX}{nxt:04d}"
 
+# Agreements numbering
+def next_agreement_no(conn: sqlite3.Connection) -> str:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT agreement_no FROM agreements WHERE agreement_no LIKE ? ORDER BY id DESC LIMIT 1",
+        (f"{AGREEMENT_PREFIX}%",),
+    )
+    row = cur.fetchone()
+    if row and isinstance(row[0], str):
+        try:
+            suffix = int(row[0].split("/")[-1])
+            nxt = suffix + 1
+        except Exception:
+            nxt = AGREEMENT_START_NUMBER
+    else:
+        nxt = AGREEMENT_START_NUMBER
+    return f"{AGREEMENT_PREFIX}{nxt:04d}"
+
 # ---------------------------
 # File system helpers
 # ---------------------------
@@ -98,6 +151,112 @@ def next_quotation_no(conn: sqlite3.Connection) -> str:
 def ensure_dirs():
     os.makedirs(DOCX_DIR, exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
+    os.makedirs(AGREEMENTS_DIR, exist_ok=True)
+    os.makedirs(FEASIBILITY_DIR, exist_ok=True)
+
+# ---------------------------
+# Agreements: helpers
+# ---------------------------
+
+def _extract_fields_from_text(txt: str) -> Dict[str, str]:
+    # Normalize spaces
+    t = re.sub(r"[\u00A0\t]+", " ", txt)
+    lines = [l.strip() for l in t.splitlines() if l.strip()]
+    joined = "\n".join(lines)
+
+    def find_after(label: str) -> str:
+        # Try "Label: value" or "Label - value" on same line
+        m = re.search(rf"{re.escape(label)}\s*[:\-]\s*(.+)", joined, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        # Try on next line
+        for i, l in enumerate(lines):
+            if re.search(rf"^{re.escape(label)}\s*[:\-]?\s*$", l, flags=re.IGNORECASE):
+                if i + 1 < len(lines):
+                    return lines[i + 1].strip()
+        return ""
+
+    date = find_after("Date")
+    name = find_after("Name of Applicant") or find_after("Name")
+    number = find_after("Mobile No") or find_after("Mobile")
+    address = find_after("Address of Premises for Installation") or find_after("Address")
+
+    return {
+        "Date": date,
+        "Name": name,
+        "Number": number,
+        "Address": address,
+    }
+
+
+def extract_fields_from_pdf(pdf_path: str) -> Dict[str, str]:
+    if not pdfplumber:
+        return {"Date": "", "Name": "", "Number": "", "Address": ""}
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+        return _extract_fields_from_text(text)
+    except Exception:
+        return {"Date": "", "Name": "", "Number": "", "Address": ""}
+
+
+def generate_agreement_docx(data: Dict[str, str]) -> io.BytesIO:
+    if not os.path.exists(TEMPLATE_AGREEMENT_PATH):
+        raise FileNotFoundError("Agreement template not found")
+    doc = Document(TEMPLATE_AGREEMENT_PATH)
+    placeholders = {
+        "[Date]": data.get("Date", ""),
+        "[Name]": data.get("Name", ""),
+        "[Address]": data.get("Address", ""),
+        "[Number]": data.get("Number", ""),
+    }
+    # Replace in paragraphs and tables
+    for p in iter_paragraphs_and_cells(doc):
+        for key, val in placeholders.items():
+            if key in p.text:
+                for r in p.runs:
+                    if key in r.text:
+                        r.text = r.text.replace(key, str(val))
+    # Save to bytes
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio
+
+
+def save_agreement_record(conn: sqlite3.Connection, rec: Dict[str, str]) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO agreements (
+            agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rec.get("agreement_no"),
+            rec.get("customer_name"),
+            rec.get("mobile"),
+            rec.get("address"),
+            rec.get("date"),
+            rec.get("feasibility_path"),
+            rec.get("agreement_pdf_path"),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def load_agreements() -> pd.DataFrame:
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(
+            "SELECT id, agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path FROM agreements ORDER BY id DESC",
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
 
 # ---------------------------
 # Helper: upload PDF to transfer.sh
@@ -1108,7 +1267,7 @@ def main():
     ensure_dirs()
     _ = get_conn()  # ensure DB exists
 
-    tabs = st.tabs(["Dashboard", "Create Invoice", "Search Invoice"])
+    tabs = st.tabs(["Dashboard", "Create Invoice", "Search Invoice", "Upload PMSG Approval of Feasibility", "Generated Agreement"])
 
     with tabs[0]:
         render_dashboard()
@@ -1139,6 +1298,12 @@ def main():
 
     with tabs[2]:
         render_search_tab()
+
+    with tabs[3]:
+        render_feasibility_upload_tab()
+
+    with tabs[4]:
+        render_agreements_list_tab()
 
 
 # ---------------------------
@@ -1401,22 +1566,7 @@ def render_create_form(
         elif edit_id is not None and prefill and prefill.get("quotation_no"):
             st.text_input("Quotation No", value=prefill.get("quotation_no"), disabled=True, key=f"{ns}_qno_edit")
 
-        submit_label = "Update Invoice" if edit_id is not None else "Create Invoice"
-        submitted = st.form_submit_button(submit_label)
-
-    if submitted:
-        data = {
-            "product": product,
-            "customer_name": customer_name.strip(),
-            "mobile": str(mobile).strip(),
-            "location": location.strip(),
-            "city": city.strip(),
-            "state": state.strip(),
-            "pincode": str(pincode).strip(),
-            "staff_name": staff_name.strip(),
-            "date_of_quotation": date_of_quotation.isoformat(),
-            "validity_date": validity_date.isoformat(),
-        }
+        # (Feasibility/Agreement upload is handled in a dedicated tab)
         # Minimal progress UI (non-intrusive)
         prog = st.progress(0, text="Starting…")
         status = st.empty()
@@ -1734,14 +1884,6 @@ def render_search_tab():
             with st.container():
                 st.markdown("#### Edit Invoice")
                 prefill = fetch_full_record(rid) or {}
-                c_cancel, _ = st.columns([1, 6])
-                with c_cancel:
-                    if st.button("Close", key=f"d_close_edit_{rid}"):
-                        st.session_state.pop("selected_edit_id", None)
-                        st.rerun()
-                render_create_form(prefill=prefill, edit_id=rid)
-
-    # Global preview/edit panels are intentionally removed for desktop table view to keep UI inline per row
 
 
 def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
