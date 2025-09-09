@@ -1,13 +1,14 @@
 import os
 import io
-import re
 import base64
 import sqlite3
 import subprocess
 import shutil
 import sys
 import importlib
+import re
 import uuid
+import zipfile
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 import streamlit as st
@@ -22,10 +23,6 @@ from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from docx.shared import Inches
 from docx2pdf import convert as docx2pdf_convert
-try:
-    import pdfplumber  # type: ignore
-except Exception:
-    pdfplumber = None
 
 # ---------------------------
 # Constants and configuration
@@ -34,17 +31,17 @@ APP_TITLE = "Mierae Invoice/Quotation Manager"
 DB_PATH = os.path.join(os.getcwd(), "invoices.db")
 TEMPLATE_PATH = os.path.join(os.getcwd(), "Mierae Quotation Template new.docx")
 TEMPLATE_PATH_55 = os.path.join(os.getcwd(), "mierae quotation 5.4.docx")
-OUTPUT_DIR = "output"
-AGREEMENTS_DIR = os.path.join(OUTPUT_DIR, "agreements")
-FEASIBILITY_DIR = os.path.join(OUTPUT_DIR, "feasibility")
+OUTPUT_DIR = os.path.join(os.getcwd(), "output")
 DOCX_DIR = os.path.join(OUTPUT_DIR, "docx")
 PDF_DIR = os.path.join(OUTPUT_DIR, "pdf")
-TEMPLATE_AGREEMENT_PATH = os.path.join(os.getcwd(), "templates", "agreement template.docx")
-# Try multiple feasibility template names
-TEMPLATE_FEASIBILITY_NAMES = [
-    os.path.join(os.getcwd(), "templates", "Approval of feasibility template.pdf"),
-    os.path.join(os.getcwd(), "templates", "_Approval of feasibility.pdf"),
-]
+# New: Agreement/Feasibility storage
+AGREEMENT_DIR = os.path.join(OUTPUT_DIR, "agreements")
+FEASIBILITY_DIR = os.path.join(AGREEMENT_DIR, "feasibility")
+AGREEMENT_PDF_DIR = os.path.join(AGREEMENT_DIR, "pdf")
+
+# Custom exceptions
+class DuplicateAgreementError(Exception):
+    pass
 
 PRODUCT_OPTIONS = [
     "3.3 kW Residential Rooftop Solar System",
@@ -53,15 +50,6 @@ PRODUCT_OPTIONS = [
 
 QUOTATION_PREFIX = "MIERAE/25-26/"
 QUOTATION_START_NUMBER = 793  # corresponds to 0001
-
-# Agreements numbering
-AGREEMENT_PREFIX = "AGR/25-26/"
-AGREEMENT_START_NUMBER = 1
-
-# Ensure output directories exist
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(AGREEMENTS_DIR, exist_ok=True)
-os.makedirs(FEASIBILITY_DIR, exist_ok=True)
 
 # ---------------------------
 # Utility: database
@@ -91,20 +79,28 @@ def get_conn() -> sqlite3.Connection:
         )
         """
     )
-    # Agreements table
+    # New: agreements table to store feasibility uploads and generated agreements
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS agreements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agreement_no TEXT UNIQUE NOT NULL,
-            customer_name TEXT,
-            mobile TEXT,
+            name TEXT,
+            number TEXT,
             address TEXT,
             date TEXT,
-            feasibility_path TEXT,
+            feasibility_pdf_path TEXT,
             agreement_pdf_path TEXT,
-            created_at TEXT,
-            updated_at TEXT
+            created_at TEXT
+        )
+        """
+    )
+    # Log of feasibility uploads (to avoid relying on filesystem for counts)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feasibility_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uploaded_at TEXT NOT NULL
         )
         """
     )
@@ -131,24 +127,6 @@ def next_quotation_no(conn: sqlite3.Connection) -> str:
         nxt = QUOTATION_START_NUMBER
     return f"{QUOTATION_PREFIX}{nxt:04d}"
 
-# Agreements numbering
-def next_agreement_no(conn: sqlite3.Connection) -> str:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT agreement_no FROM agreements WHERE agreement_no LIKE ? ORDER BY id DESC LIMIT 1",
-        (f"{AGREEMENT_PREFIX}%",),
-    )
-    row = cur.fetchone()
-    if row and isinstance(row[0], str):
-        try:
-            suffix = int(row[0].split("/")[-1])
-            nxt = suffix + 1
-        except Exception:
-            nxt = AGREEMENT_START_NUMBER
-    else:
-        nxt = AGREEMENT_START_NUMBER
-    return f"{AGREEMENT_PREFIX}{nxt:04d}"
-
 # ---------------------------
 # File system helpers
 # ---------------------------
@@ -156,112 +134,10 @@ def next_agreement_no(conn: sqlite3.Connection) -> str:
 def ensure_dirs():
     os.makedirs(DOCX_DIR, exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
-    os.makedirs(AGREEMENTS_DIR, exist_ok=True)
+    # New: ensure agreement-related directories
+    os.makedirs(AGREEMENT_DIR, exist_ok=True)
     os.makedirs(FEASIBILITY_DIR, exist_ok=True)
-
-# ---------------------------
-# Agreements: helpers
-# ---------------------------
-
-def _extract_fields_from_text(txt: str) -> Dict[str, str]:
-    # Normalize spaces
-    t = re.sub(r"[\u00A0\t]+", " ", txt)
-    lines = [l.strip() for l in t.splitlines() if l.strip()]
-    joined = "\n".join(lines)
-
-    def find_after(label: str) -> str:
-        # Try "Label: value" or "Label - value" on same line
-        m = re.search(rf"{re.escape(label)}\s*[:\-]\s*(.+)", joined, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        # Try on next line
-        for i, l in enumerate(lines):
-            if re.search(rf"^{re.escape(label)}\s*[:\-]?\s*$", l, flags=re.IGNORECASE):
-                if i + 1 < len(lines):
-                    return lines[i + 1].strip()
-        return ""
-
-    date = find_after("Date")
-    name = find_after("Name of Applicant") or find_after("Name")
-    number = find_after("Mobile No") or find_after("Mobile")
-    address = find_after("Address of Premises for Installation") or find_after("Address")
-
-    return {
-        "Date": date,
-        "Name": name,
-        "Number": number,
-        "Address": address,
-    }
-
-
-def extract_fields_from_pdf(pdf_path: str) -> Dict[str, str]:
-    if not pdfplumber:
-        return {"Date": "", "Name": "", "Number": "", "Address": ""}
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join([p.extract_text() or "" for p in pdf.pages])
-        return _extract_fields_from_text(text)
-    except Exception:
-        return {"Date": "", "Name": "", "Number": "", "Address": ""}
-
-
-def generate_agreement_docx(data: Dict[str, str]) -> io.BytesIO:
-    if not os.path.exists(TEMPLATE_AGREEMENT_PATH):
-        raise FileNotFoundError("Agreement template not found")
-    doc = Document(TEMPLATE_AGREEMENT_PATH)
-    placeholders = {
-        "[Date]": data.get("Date", ""),
-        "[Name]": data.get("Name", ""),
-        "[Address]": data.get("Address", ""),
-        "[Number]": data.get("Number", ""),
-    }
-    # Replace in paragraphs and tables
-    for p in iter_paragraphs_and_cells(doc):
-        for key, val in placeholders.items():
-            if key in p.text:
-                for r in p.runs:
-                    if key in r.text:
-                        r.text = r.text.replace(key, str(val))
-    # Save to bytes
-    bio = io.BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio
-
-
-def save_agreement_record(conn: sqlite3.Connection, rec: Dict[str, str]) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        INSERT INTO agreements (
-            agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            rec.get("agreement_no"),
-            rec.get("customer_name"),
-            rec.get("mobile"),
-            rec.get("address"),
-            rec.get("date"),
-            rec.get("feasibility_path"),
-            rec.get("agreement_pdf_path"),
-            now,
-            now,
-        ),
-    )
-    conn.commit()
-
-
-def load_agreements() -> pd.DataFrame:
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query(
-            "SELECT id, agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path FROM agreements ORDER BY id DESC",
-            conn,
-        )
-    finally:
-        conn.close()
-    return df
+    os.makedirs(AGREEMENT_PDF_DIR, exist_ok=True)
 
 # ---------------------------
 # Helper: upload PDF to transfer.sh
@@ -1031,128 +907,82 @@ def normalize_layout(doc: DocxDocument) -> None:
 
 
 def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
-    """Convert DOCX to PDF using multiple fallback methods"""
-    
     # Ensure target directory exists
     try:
         os.makedirs(os.path.dirname(target_pdf_path), exist_ok=True)
     except Exception:
         pass
 
-    # Method 1: Try docx2pdf with proper error handling
+    # 1) Try LibreOffice (fast, headless) if available (works on Linux/Streamlit Cloud and Windows if installed)
     try:
-        from docx2pdf import convert as docx2pdf_convert
-        
-        # Ensure absolute paths
-        src = os.path.abspath(docx_path)
-        dst = os.path.abspath(target_pdf_path)
-        
-        # Remove existing target file
-        if os.path.exists(dst):
-            os.remove(dst)
-        
-        # Direct file conversion
-        docx2pdf_convert(src, dst)
-        
-        # Check if conversion succeeded
-        if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            return dst
-            
-    except Exception as e:
-        print(f"docx2pdf method 1 failed: {e}")
-        
-    # Method 2: Try docx2pdf with directory output
-    try:
-        from docx2pdf import convert as docx2pdf_convert
-        
-        src = os.path.abspath(docx_path)
-        outdir = os.path.dirname(os.path.abspath(target_pdf_path))
-        
-        # Convert to directory
-        docx2pdf_convert(src, outdir)
-        
-        # Find the generated PDF
-        base_name = os.path.splitext(os.path.basename(src))[0]
-        generated_pdf = os.path.join(outdir, f"{base_name}.pdf")
-        
-        if os.path.exists(generated_pdf):
-            # Move to target location if different
-            if os.path.abspath(generated_pdf) != os.path.abspath(target_pdf_path):
-                if os.path.exists(target_pdf_path):
-                    os.remove(target_pdf_path)
-                os.rename(generated_pdf, target_pdf_path)
-            return target_pdf_path
-            
-    except Exception as e:
-        print(f"docx2pdf method 2 failed: {e}")
-
-    # Method 3: Try LibreOffice
-    try:
-        import subprocess
-        import shutil
-        
-        # Find LibreOffice
+        # Try PATH first
         soffice = shutil.which("soffice") or shutil.which("soffice.exe")
-        
+        # Allow overriding via environment variable
         if not soffice:
-            # Try common Windows paths
-            for path in [
-                r"C:\Program Files\LibreOffice\program\soffice.exe",
-                r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"
-            ]:
-                if os.path.exists(path):
-                    soffice = path
-                    break
-        
-        if soffice:
+            env_lo = os.environ.get("LIBREOFFICE_PATH")
+            if env_lo and os.path.exists(env_lo):
+                soffice = env_lo
+        # Try common Windows install path
+        if not soffice:
+            win_lo = r"C:\\Program Files\\LibreOffice\\program\\soffice.exe"
+            if os.path.exists(win_lo):
+                soffice = win_lo
+        if soffice and os.path.exists(docx_path):
             outdir = os.path.dirname(target_pdf_path)
             cmd = [
                 soffice,
-                "--headless", 
-                "--convert-to", "pdf",
-                "--outdir", outdir,
-                docx_path
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                outdir,
+                docx_path,
             ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            # Check for generated PDF
-            base_name = os.path.splitext(os.path.basename(docx_path))[0]
-            generated_pdf = os.path.join(outdir, f"{base_name}.pdf")
-            
-            if os.path.exists(generated_pdf):
-                if os.path.abspath(generated_pdf) != os.path.abspath(target_pdf_path):
-                    if os.path.exists(target_pdf_path):
-                        os.remove(target_pdf_path)
-                    os.rename(generated_pdf, target_pdf_path)
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            base = os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+            produced = os.path.join(outdir, base)
+            if os.path.exists(produced):
+                if os.path.abspath(produced) != os.path.abspath(target_pdf_path):
+                    try:
+                        if os.path.exists(target_pdf_path):
+                            os.remove(target_pdf_path)
+                    except Exception:
+                        pass
+                    os.replace(produced, target_pdf_path)
                 return target_pdf_path
-                
-    except Exception as e:
-        print(f"LibreOffice failed: {e}")
+    except Exception:
+        pass
 
-    # Method 4: Try MS Word COM (last resort)
+    # 2) Fallback: Word via docx2pdf (Windows only)
     try:
-        import win32com.client
-        
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = False
-        
-        doc = word.Documents.Open(os.path.abspath(docx_path))
-        doc.SaveAs2(os.path.abspath(target_pdf_path), FileFormat=17)
-        doc.Close()
-        word.Quit()
-        
-        if os.path.exists(target_pdf_path):
-            return target_pdf_path
-            
-    except Exception as e:
-        print(f"Word COM failed: {e}")
-
+        src = os.path.abspath(docx_path)
+        dst = os.path.abspath(target_pdf_path)
+        # Try file-to-file
+        docx2pdf_convert(src, dst)
+        if os.path.exists(dst):
+            return dst
+        # Try file-to-directory (docx2pdf will name the PDF same as DOCX base)
+        outdir = os.path.dirname(dst)
+        os.makedirs(outdir, exist_ok=True)
+        docx2pdf_convert(src, outdir)
+        produced = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if os.path.exists(produced):
+            # Move/rename to target path if needed
+            if os.path.abspath(produced) != os.path.abspath(dst):
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                except Exception:
+                    pass
+                os.replace(produced, dst)
+            return dst
+    except Exception:
+        pass
     return None
 
 
 def save_to_db(conn: sqlite3.Connection, record: Dict[str, str]) -> None:
+    """Save a record to the database."""
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
@@ -1183,6 +1013,7 @@ def save_to_db(conn: sqlite3.Connection, record: Dict[str, str]) -> None:
 
 
 def load_invoices() -> pd.DataFrame:
+    """Load invoices from the database."""
     conn = get_conn()
     try:
         df = pd.read_sql_query(
@@ -1195,6 +1026,7 @@ def load_invoices() -> pd.DataFrame:
 
 
 def delete_invoice(inv_id: int) -> None:
+    """Delete an invoice from the database."""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -1216,6 +1048,100 @@ def delete_invoice(inv_id: int) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def edit_agreement(agr_id: int, tags: Dict[str, str]) -> Optional[str]:
+    """Regenerate an agreement PDF for the given record, keeping the same agreement_no and
+    replacing the previous PDF in-place. Also updates name/number/address/date fields in DB.
+    Returns the new PDF path (or None if conversion failed)."""
+    rec = fetch_agreement_record(agr_id)
+    if not rec:
+        raise ValueError("Agreement not found")
+    ensure_dirs()
+    base = safe_filename(rec.get("agreement_no", f"AGR-{agr_id}"))
+    template_path = os.path.join(os.getcwd(), "templates", "agreement template.docx")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError("templates/agreement template.docx not found")
+
+    temp_docx = os.path.join(DOCX_DIR, f"{base}.docx")
+    try:
+        if os.path.exists(temp_docx):
+            os.remove(temp_docx)
+    except Exception:
+        pass
+
+    # Populate using XML-level tag replacement
+    _docx_zip_replace_tags(template_path, temp_docx, {
+        "Date": tags.get("Date", rec.get("date", "")),
+        "Name": tags.get("Name", rec.get("name", "")),
+        "Address": tags.get("Address", rec.get("address", "")),
+        "Number": tags.get("Number", rec.get("number", "")),
+    })
+    # Additional pass for split runs
+    try:
+        doc = Document(temp_docx)
+        _replace_tags_in_docx(doc, {
+            "Date": tags.get("Date", rec.get("date", "")),
+            "Name": tags.get("Name", rec.get("name", "")),
+            "Address": tags.get("Address", rec.get("address", "")),
+            "Number": tags.get("Number", rec.get("number", "")),
+        })
+        clear_all_highlights(doc)
+        # remove character spacing
+        try:
+            NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            for p in iter_paragraphs_and_cells(doc):
+                for r in p.runs:
+                    try:
+                        rpr = r._element.rPr
+                        if rpr is not None:
+                            for node in r._element.xpath('.//w:spacing|.//w:kern', namespaces=NS):
+                                parent = node.getparent()
+                                if parent is not None:
+                                    parent.remove(node)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        doc.save(temp_docx)
+    except Exception:
+        pass
+
+    target_pdf = os.path.join(AGREEMENT_PDF_DIR, f"{base}.pdf")
+    try:
+        if os.path.exists(target_pdf):
+            os.remove(target_pdf)
+    except Exception:
+        pass
+    pdf_path = _convert_to_pdf_word_first(temp_docx, target_pdf)
+    if pdf_path:
+        try:
+            if os.path.exists(temp_docx):
+                os.remove(temp_docx)
+        except Exception:
+            pass
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE agreements
+            SET name=?, number=?, address=?, date=?, agreement_pdf_path=?
+            WHERE id=?
+            """,
+            (
+                tags.get("Name", rec.get("name", "")),
+                tags.get("Number", rec.get("number", "")),
+                tags.get("Address", rec.get("address", "")),
+                tags.get("Date", rec.get("date", "")),
+                pdf_path,
+                agr_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return pdf_path
 
 
 def edit_invoice(inv_id: int, form_data: Dict[str, str], template_path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1308,6 +1234,1003 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str], template_path: str) -> 
     finally:
         conn.close()
 
+
+# ---------------------------
+# Agreements: parsing, storage, generation
+# ---------------------------
+
+AGREEMENT_PREFIX = "AGR"
+
+def _next_agreement_no(conn: sqlite3.Connection) -> str:
+    """Generate next agreement number like AGR-YYYYMM-XXXX."""
+    now = datetime.now()
+    ym = now.strftime("%Y%m")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM agreements WHERE agreement_no LIKE ?", (f"{AGREEMENT_PREFIX}-{ym}-%",))
+    n = cur.fetchone()[0] or 0
+    return f"{AGREEMENT_PREFIX}-{ym}-{n+1:04d}"
+
+
+def _save_feasibility_pdf(file_bytes: bytes, filename_hint: str) -> str:
+    """Save feasibility PDF to a single canonical file to avoid duplicates across reruns.
+    We always overwrite FEASIBILITY_DIR/feasibility.pdf
+    """
+    ensure_dirs()
+    path = os.path.join(FEASIBILITY_DIR, "feasibility.pdf")
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+    with open(path, "wb") as f:
+        f.write(file_bytes)
+    # Log the upload event in DB
+    conn = get_conn()
+    try:
+        conn.execute("INSERT INTO feasibility_events (uploaded_at) VALUES (?)", (datetime.now().isoformat(timespec="seconds"),))
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _read_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract text, preferring pdfminer for higher fidelity, with PyPDF2 fallback."""
+    # 1) Try pdfminer.six (best for structured text in tables)
+    try:
+        from pdfminer.high_level import extract_text as _pdfminer_extract
+        bio1 = io.BytesIO(pdf_bytes)
+        txt = _pdfminer_extract(bio1) or ""
+        if txt and txt.strip():
+            return txt
+    except Exception:
+        pass
+    # 2) Fallback to PyPDF2
+    try:
+        from PyPDF2 import PdfReader
+        bio2 = io.BytesIO(pdf_bytes)
+        reader = PdfReader(bio2)
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
+def _extract_fields_from_text(text: str) -> Dict[str, str]:
+    """Extract Date, Name of Applicant, Mobile No, Address of Premises for Installation.
+    Return keys: Date, Name, Address, Number.
+    """
+    t = re.sub(r"\r", "\n", text or "")
+    t = re.sub(r"\u00A0", " ", t)
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+
+    def value_after_inline(ln: str) -> Optional[str]:
+        # Split by common separators
+        for sep in [":", "-", "\t", "  "]:
+            if sep in ln:
+                parts = ln.split(sep, 1)
+                if len(parts) == 2:
+                    return parts[1].strip()
+        # If no separator, take last token fallback (not ideal)
+        toks = ln.split()
+        if len(toks) > 1:
+            return " ".join(toks[1:]).strip()
+        return None
+
+    def find_after(label_patterns: List[str]) -> Optional[str]:
+        for pat in label_patterns:
+            m = re.search(rf"{pat}\s*[:\-]\s*(.+)", joined, flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                val = re.split(r"\s{2,}|\s*(?:Name of Applicant|Mobile\s*No|Address of Premises for Installation|Date)\s*[:\-]", val, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+                return val
+        for idx, ln in enumerate(lines):
+            for pat in label_patterns:
+                if re.search(rf"^{pat}\s*[:\-]?\s*$", ln, flags=re.IGNORECASE):
+                    if idx + 1 < len(lines):
+                        return lines[idx + 1].strip()
+        return None
+
+    # Primary label-based capture
+    date_val = find_after([r"Date"]) or None
+    name_val = find_after([r"Name\s+of\s+Applicant", r"Applicant\s*Name"]) or None
+    mobile_val = find_after([r"Mobile\s*No", r"Mobile\s*Number", r"Contact\s*No"]) or None
+    # Address block: capture block after "Address of Premises for installation" up to next numbered section or blank
+    addr_idx = None
+    for i, ln in enumerate(lines):
+        if re.search(r"Address\s+of\s+Premises\s+for\s+installation", ln, flags=re.IGNORECASE):
+            addr_idx = i
+            break
+    address_val = None
+    if addr_idx is not None:
+        block = []
+        for j in range(addr_idx + 1, min(addr_idx + 10, len(lines))):
+            l = lines[j]
+            if re.match(r"^\d+\.|^Feasibility\s+Approval\s+Details", l, flags=re.IGNORECASE):
+                break
+            if re.match(r"^(From|To)\b", l, flags=re.IGNORECASE):
+                break
+            block.append(l)
+        # Extract parts
+        base_addr = None
+        district = None
+        state = None
+        pincode = None
+        for b in block:
+            if re.search(r"^District\s*:\s*", b, flags=re.IGNORECASE):
+                district = re.sub(r"^District\s*:\s*", "", b, flags=re.IGNORECASE).strip().strip(',')
+            elif re.search(r"^State\s*:\s*", b, flags=re.IGNORECASE):
+                state = re.sub(r"^State\s*:\s*", "", b, flags=re.IGNORECASE).strip().strip(',')
+            elif re.search(r"^(PIN\s*Code|Pincode)\s*:\s*", b, flags=re.IGNORECASE):
+                pincode = re.sub(r"^(PIN\s*Code|Pincode)\s*:\s*", "", b, flags=re.IGNORECASE).strip().strip(',')
+            elif not base_addr:
+                base_addr = b.strip().strip(',')
+        if base_addr or district or state or pincode:
+            # Compose without labels, e.g., "12/21B, Ashoke Nagar Road, Barasat, West Bengal, 112233"
+            parts = [x for x in [base_addr, district, state, pincode] if x]
+            addr = ", ".join(parts)
+            # Normalize spacing: collapse multiple spaces; trim spaces around commas
+            addr = re.sub(r"\s+", " ", addr)
+            addr = re.sub(r"\s*,\s*", ", ", addr)
+            addr = re.sub(r",\s*,+", ", ", addr)
+            address_val = addr.strip()
+
+    # Fallbacks if primary capture failed
+    joined_lower = joined.lower()
+    if not mobile_val:
+        # Row-based scan for Mobile No – strictly target the same row then immediate next few lines
+        mob_row_pattern = re.compile(r"\b(?:mobile\s*(?:no\.?|number)|contact\s*no\.?|phone\s*no\.?)\b", re.IGNORECASE)
+        for i, ln in enumerate(lines):
+            if mob_row_pattern.search(ln):
+                # 1) Try to take digits from the same line after the label
+                tail = mob_row_pattern.split(ln, maxsplit=1)[-1]
+                # remove separators then extract digits
+                d_same = re.findall(r"\d{8,13}", tail)
+                if not d_same:
+                    # Also handle formats with spaces/dashes in the number
+                    d_same2 = re.findall(r"(?:\d[\s\-]?){9,14}\d", tail)
+                    if d_same2:
+                        d_join = re.sub(r"\D", "", d_same2[-1])
+                        if 8 <= len(d_join) <= 13:
+                            d_same = [d_join]
+                if d_same:
+                    # prefer 10-digit
+                    pick = [x for x in d_same if len(x) == 10]
+                    mobile_val = (pick[-1] if pick else d_same[-1])
+                    break
+                # 2) Look at the next few lines for the value cell; pick first that has an 8–13 digit sequence
+                grabbed = False
+                for j in range(i+1, min(i+5, len(lines))):
+                    cand = lines[j].strip()
+                    if not cand:
+                        continue
+                    # skip if looks like another label row
+                    if re.search(r":|email|consumer|category|address|application|reference|discom|particulars|details", cand, flags=re.IGNORECASE):
+                        continue
+                    d_next = re.findall(r"\d{8,13}", cand)
+                    if not d_next:
+                        d_next2 = re.findall(r"(?:\d[\s\-]?){9,14}\d", cand)
+                        if d_next2:
+                            d_next = [re.sub(r"\D", "", d_next2[-1])]
+                    if d_next:
+                        pick = [x for x in d_next if len(x) == 10]
+                        mobile_val = (pick[-1] if pick else d_next[-1])
+                        grabbed = True
+                        break
+                if grabbed:
+                    break
+    # If still not found, pick best digit-only candidate of length 10-13
+    if not mobile_val:
+        cands = re.findall(r"\b\d{10,13}\b", joined)
+        if cands:
+            # prefer 10-digit, else longest
+            ten = [c for c in cands if len(c) == 10]
+            mobile_val = ten[0] if ten else max(cands, key=len)
+    if not date_val:
+        # Header style: granted on date: dd-mm-yyyy
+        m = re.search(r"granted\s+on\s+date\s*[:\-]?\s*([0-9]{1,2}[^0-9A-Za-z][0-9]{1,2}[^0-9A-Za-z][0-9]{2,4})", joined_lower, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"date\s*[:\-]?\s*([0-9]{1,2}[^0-9A-Za-z][0-9]{1,2}[^0-9A-Za-z][0-9]{2,4})", joined_lower, flags=re.IGNORECASE)
+        if m:
+            date_val = m.group(1)
+    def is_valid_name(s: Optional[str]) -> bool:
+        if not s:
+            return False
+        t = s.strip()
+        if not t:
+            return False
+        low = t.lower()
+        # disqualify obvious labels
+        forbidden = [
+            'mobile', 'phone', 'email', 'email id', 'consumer', 'category', 'address',
+            'application', 'reference', 'number', 'no.', 'capacity', 'kwp', 'kw', 'discom',
+        ]
+        if any(k in low for k in forbidden):
+            return False
+        # must contain letters and not be mostly digits
+        letters = len(re.findall(r"[A-Za-z]", t))
+        digits = len(re.findall(r"\d", t))
+        return letters >= 2 and letters > digits
+
+    if not is_valid_name(name_val):
+        # Row-based scan (handles tables) around the label row
+        for i, ln in enumerate(lines):
+            if re.search(r"\bname\s*of\s*applicant\b", ln, flags=re.IGNORECASE):
+                # prefer taking the RIGHT column/value on the same line
+                # patterns: <label> : <value>  OR  <label> <many spaces or tab> <value>
+                m_same = re.search(r"\bname\s*of\s*applicant\b\s*(?:[:\-]|\s{2,}|\t)\s*(.+)$", ln, flags=re.IGNORECASE)
+                v = None
+                if m_same:
+                    v = m_same.group(1).strip()
+                else:
+                    # As a fallback, split by two+ spaces and take last chunk to mimic table column split
+                    parts = re.split(r"\s{2,}|\t", ln)
+                    # ensure left-most chunk contains the label; take last non-empty chunk as value
+                    if len(parts) >= 2 and re.search(r"\bname\s*of\s*applicant\b", parts[0], flags=re.IGNORECASE):
+                        v = parts[-1].strip()
+                if not is_valid_name(v):
+                    # try the very next non-empty line as the details cell
+                    # but skip if it obviously looks like another label row (contains ':' or known keywords)
+                    for j in range(i+1, min(i+5, len(lines))):
+                        cand = lines[j].strip()
+                        lowc = cand.lower()
+                        if not cand:
+                            continue
+                        if ':' in cand:
+                            continue
+                        if any(k in lowc for k in ['mobile', 'phone', 'email', 'consumer', 'category', 'address', 'application', 'reference']):
+                            continue
+                        if is_valid_name(cand):
+                            v = cand
+                            break
+                if not is_valid_name(v):
+                    # search next few rows for a name-like candidate
+                    for j in range(i+1, min(i+8, len(lines))):
+                        cand = lines[j].strip()
+                        if is_valid_name(cand):
+                            v = cand
+                            break
+                    # also look a couple of lines above in case of wrap
+                    if not is_valid_name(v):
+                        for j in range(max(0, i-3), i):
+                            cand = lines[j].strip()
+                            if is_valid_name(cand):
+                                v = cand
+                                break
+                if is_valid_name(v):
+                    name_val = v
+                    break
+        # Header-style fallback like 'Shri/Smt <NAME> ...'
+        if not is_valid_name(name_val):
+            m = re.search(r"(Shri|Smt|Shri/Smt|Sh\.?/Smt\.?)\s*[:.-]?\s*([A-Z][A-Za-z .,-]+)", joined, flags=re.IGNORECASE)
+            if m and is_valid_name(m.group(1)):
+                name_val = (m.group(2) or m.group(1)).strip()
+
+    if mobile_val:
+        # Normalize: extract digits, prefer a clean 10-digit Indian-style number if present
+        digits = re.findall(r"\d", mobile_val)
+        if digits:
+            s = "".join(digits)
+            # If there is a 10-digit substring, take the last one
+            m10 = re.findall(r"\d{10}", s)
+            if m10:
+                mobile_val = m10[-1]
+            elif len(s) >= 10:
+                mobile_val = s[-10:]
+            else:
+                mobile_val = s
+
+    def norm_date(s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%d %b %Y", "%d %B %Y"):
+            try:
+                d = datetime.strptime(s.strip(), fmt).date()
+                return d.strftime("%d-%m-%Y")
+            except Exception:
+                continue
+        m = re.search(r"(\d{1,2})[^0-9A-Za-z](\d{1,2})[^0-9A-Za-z](\d{2,4})", s)
+        if m:
+            d, mth, y = m.groups()
+            y = y if len(y) == 4 else ("20" + y)
+            try:
+                return datetime(int(y), int(mth), int(d)).strftime("%d-%m-%Y")
+            except Exception:
+                pass
+        return s.strip()
+
+    return {
+        "Date": norm_date(date_val) or "",
+        "Name": (name_val or "").strip(),
+        "Address": (address_val or "").strip(),
+        "Number": (mobile_val or "").strip(),
+    }
+
+
+def _replace_tags_in_docx(doc: DocxDocument, mapping: Dict[str, str]) -> None:
+    """Replace tag placeholders across the document.
+    Strategy:
+    1) First pass replaces sequences of YELLOW-highlighted runs whose combined text equals a tag like [Name].
+       This preserves surrounding formatting and focuses only on highlighted placeholders.
+    2) Second pass does a paragraph-level replace for any remaining tags (non-highlighted), by joining run texts,
+       then writing the replaced string into the first run and clearing the rest. This is a fallback to catch
+       placeholders that aren't highlighted, at the cost of losing mixed-run formatting inside that paragraph.
+    """
+    TAGS = {"[Date]": mapping.get("Date", ""),
+            "[Name]": mapping.get("Name", ""),
+            "[Address]": mapping.get("Address", ""),
+            "[Number]": mapping.get("Number", "")}
+
+    # 1) Replace in contiguous highlighted sequences
+    for p in iter_paragraphs_and_cells(doc):
+        runs = list(p.runs)
+        i = 0
+        while i < len(runs):
+            # collect contiguous yellow runs
+            j = i
+            seq = []
+            while j < len(runs):
+                r = runs[j]
+                try:
+                    if r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
+                        seq.append(r)
+                        j += 1
+                        continue
+                except Exception:
+                    pass
+                break
+            if seq:
+                combined = "".join([x.text for x in seq])
+                # exact tag match or contains tag (sometimes brackets split into separate runs)
+                replaced = False
+                for tag, val in TAGS.items():
+                    if combined == tag or tag in combined:
+                        # put value in first run, clear the rest
+                        seq[0].text = val or ""
+                        for k in range(1, len(seq)):
+                            seq[k].text = ""
+                        replaced = True
+                        break
+                i = j  # skip processed seq
+                continue
+            i += 1
+
+    # 2) Fallback paragraph-wide substitution for any leftover naked tags
+    for p in iter_paragraphs_and_cells(doc):
+        try:
+            full = "".join(r.text for r in p.runs)
+            new_full = full
+            for tag, val in TAGS.items():
+                if tag in new_full:
+                    new_full = new_full.replace(tag, val or "")
+            if new_full != full and p.runs:
+                p.runs[0].text = new_full
+                for r in p.runs[1:]:
+                    r.text = ""
+        except Exception:
+            pass
+
+
+def _convert_to_pdf_word_first(docx_path: str, target_pdf_path: str) -> Optional[str]:
+    """Prefer MS Word via docx2pdf for best layout fidelity on Windows, then fallback to LibreOffice."""
+    # Try Word/docx2pdf first
+    try:
+        src = os.path.abspath(docx_path)
+        dst = os.path.abspath(target_pdf_path)
+        docx2pdf_convert(src, dst)
+        if os.path.exists(dst):
+            return dst
+        outdir = os.path.dirname(dst)
+        os.makedirs(outdir, exist_ok=True)
+        docx2pdf_convert(src, outdir)
+        produced = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if os.path.exists(produced):
+            if os.path.abspath(produced) != os.path.abspath(dst):
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                except Exception:
+                    pass
+                os.replace(produced, dst)
+            return dst
+    except Exception:
+        pass
+    # Fallback to existing pipeline (LibreOffice then Word)
+    return convert_to_pdf(docx_path, target_pdf_path)
+
+
+def _docx_zip_replace_tags(template_path: str, out_path: str, mapping: Dict[str, str]) -> None:
+    """Do a raw XML text replacement for placeholders across all word/*.xml parts to preserve layout.
+    mapping keys should be simple text like 'Date', 'Name', etc., and placeholders are [Date], [Name], etc.
+    """
+    placeholders = {f"[{k}]": (v or "") for k, v in mapping.items()}
+    with zipfile.ZipFile(template_path, 'r') as zin:
+        with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.startswith("word/") and item.filename.endswith(".xml"):
+                    try:
+                        xml = data.decode('utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            xml = data.decode('cp1252')
+                        except Exception:
+                            xml = data.decode('utf-8', errors='ignore')
+                    # Replace all placeholders (plain match and tag-insensitive regex match)
+                    for ph, val in placeholders.items():
+                        if ph in xml:
+                            xml = xml.replace(ph, val)
+                        # Tag-insensitive match: allow arbitrary XML tags and optional spaces inside brackets
+                        # Example: matches "[Name]", "[ Name ]" even when split across <w:t> runs
+                        def build_tag_insensitive_pattern(text: str) -> str:
+                            core = text.strip("[]")
+                            parts = [r"\[\s*"]
+                            for ch in core:
+                                parts.append(re.escape(ch))
+                                parts.append(r"(?:\s*<[^>]+>\s*)*")
+                            parts.append(r"\s*\]")
+                            return "".join(parts)
+                        pat = build_tag_insensitive_pattern(ph)
+                        try:
+                            xml = re.sub(pat, val, xml)
+                        except Exception:
+                            pass
+                    # Strip character spacing and kerning tags that cause spaced-out letters
+                    try:
+                        # Remove self-closing and open/close variants
+                        xml = re.sub(r"<w:spacing[^>]*/>", "", xml)
+                        xml = re.sub(r"<w:spacing[^>]*>\s*</w:spacing>", "", xml)
+                        xml = re.sub(r"<w:kern[^>]*/>", "", xml)
+                        xml = re.sub(r"<w:kern[^>]*>\s*</w:kern>", "", xml)
+                        # Replace distributed justification which creates per-character spacing
+                        xml = re.sub(r"<w:jc[^>]*w:val=\"distribute\"[^>]*/>", "<w:jc w:val=\"left\"/>", xml)
+                        xml = re.sub(r"<w:jc[^>]*w:val=\"thaiDistribute\"[^>]*/>", "<w:jc w:val=\"left\"/>", xml)
+                        # Open/close jc tags as well
+                        xml = re.sub(r"<w:jc[^>]*w:val=\"distribute\"[^>]*>\s*</w:jc>", "<w:jc w:val=\"left\"/>", xml)
+                        xml = re.sub(r"<w:jc[^>]*w:val=\"thaiDistribute\"[^>]*>\s*</w:jc>", "<w:jc w:val=\"left\"/>", xml)
+                        # Remove East-Asian spacing control that can expand characters
+                        xml = re.sub(r"<w:characterSpacingControl[^>]*/>", "", xml)
+                        xml = re.sub(r"<w:characterSpacingControl[^>]*>\s*</w:characterSpacingControl>", "", xml)
+                        # DrawingML (text boxes) spacing/alignment
+                        xml = re.sub(r"<a:spcPct[^>]*/>", "", xml)
+                        xml = re.sub(r"<a:spcPts[^>]*/>", "", xml)
+                        xml = re.sub(r"<a:spcPct[^>]*>\s*</a:spcPct>", "", xml)
+                        xml = re.sub(r"<a:spcPts[^>]*>\s*</a:spcPts>", "", xml)
+                        xml = re.sub(r"<a:algn[^>]*val=\"dist\"[^>]*/>", "<a:algn val=\"l\"/>", xml)
+                        xml = re.sub(r"<a:algn[^>]*val=\"dist\"[^>]*>\s*</a:algn>", "<a:algn val=\"l\"/>", xml)
+                    except Exception:
+                        pass
+                    data = xml.encode('utf-8')
+                zout.writestr(item, data)
+
+
+def generate_agreement_pdf(tags: Dict[str, str], feasibility_pdf_path: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Populate agreement template with tags at XML level and convert to PDF. Returns (docx_temp, pdf_path, agreement_no).
+
+    Duplicate policy: If an agreement already exists with the same (Name, Number, Address),
+    we raise DuplicateAgreementError so the UI can notify the user to check Generated Agreement.
+    The user can then edit/replace from the Generated Agreement tab if needed.
+    """
+    ensure_dirs()
+    # Duplicate detection
+    name_v = (tags.get("Name", "") or "").strip()
+    number_v = (tags.get("Number", "") or "").strip()
+    address_v = (tags.get("Address", "") or "").strip()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, agreement_no FROM agreements
+            WHERE LOWER(COALESCE(name,'')) = LOWER(?)
+              AND LOWER(COALESCE(address,'')) = LOWER(?)
+              AND COALESCE(number,'') = ?
+            LIMIT 1
+            """,
+            (name_v, address_v, number_v),
+        )
+        dup = cur.fetchone()
+        if dup:
+            raise DuplicateAgreementError(f"Duplicate exists with Agreement No: {dup[1]}")
+    finally:
+        conn.close()
+
+    conn = get_conn()
+    try:
+        agreement_no = _next_agreement_no(conn)
+    finally:
+        conn.close()
+
+    template_path = os.path.join(os.getcwd(), "templates", "agreement template.docx")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError("templates/agreement template.docx not found")
+
+    base = safe_filename(agreement_no)
+    temp_docx = os.path.join(DOCX_DIR, f"{base}.docx")
+    try:
+        if os.path.exists(temp_docx):
+            os.remove(temp_docx)
+    except Exception:
+        pass
+    # XML-level replace preserves formatting and updates everywhere (including text boxes)
+    _docx_zip_replace_tags(template_path, temp_docx, {
+        "Date": tags.get("Date", ""),
+        "Name": tags.get("Name", ""),
+        "Address": tags.get("Address", ""),
+        "Number": tags.get("Number", ""),
+    })
+
+    # Run python-docx pass too to catch tags that are split across runs within body paragraphs/tables
+    try:
+        doc = Document(temp_docx)
+        # Helper to remove character spacing (tracking) so long addresses don't show spaced letters
+        def _clear_char_spacing(_doc: DocxDocument) -> None:
+            NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            # Clear on all runs
+            for p in iter_paragraphs_and_cells(_doc):
+                for r in p.runs:
+                    try:
+                        rpr = r._element.rPr
+                        if rpr is not None:
+                            for node in r._element.xpath('.//w:spacing|.//w:kern', namespaces=NS):
+                                parent = node.getparent()
+                                if parent is not None:
+                                    parent.remove(node)
+                    except Exception:
+                        pass
+            # Clear at style level (paragraph and character styles)
+            try:
+                for style in _doc.styles:
+                    try:
+                        el = style._element
+                        for path in ['.//w:rPr/w:spacing', './/w:rPr/w:kern']:
+                            for node in el.xpath(path, namespaces=NS):
+                                parent = node.getparent()
+                                if parent is not None:
+                                    parent.remove(node)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        _replace_tags_in_docx(doc, {
+            "Date": tags.get("Date", ""),
+            "Name": tags.get("Name", ""),
+            "Address": tags.get("Address", ""),
+            "Number": tags.get("Number", ""),
+        })
+        clear_all_highlights(doc)
+        _clear_char_spacing(doc)
+        doc.save(temp_docx)
+    except Exception:
+        pass
+
+    target_pdf = os.path.join(AGREEMENT_PDF_DIR, f"{base}.pdf")
+    try:
+        if os.path.exists(target_pdf):
+            os.remove(target_pdf)
+    except Exception:
+        pass
+    # Use Word-first for agreements to preserve template formatting
+    pdf_path = _convert_to_pdf_word_first(temp_docx, target_pdf)
+
+    # If conversion failed, keep DOCX so user can download; else delete temp DOCX
+    if pdf_path:
+        try:
+            if os.path.exists(temp_docx):
+                os.remove(temp_docx)
+        except Exception:
+            pass
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO agreements (agreement_no, name, number, address, date, feasibility_pdf_path, agreement_pdf_path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                agreement_no,
+                tags.get("Name", ""),
+                tags.get("Number", ""),
+                tags.get("Address", ""),
+                tags.get("Date", ""),
+                feasibility_pdf_path,
+                pdf_path,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return None, pdf_path, agreement_no
+
+
+def load_agreements() -> pd.DataFrame:
+    conn = get_conn()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT id, agreement_no, name, number, address, date, feasibility_pdf_path, agreement_pdf_path, created_at
+            FROM agreements
+            ORDER BY id DESC
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
+
+
+def fetch_agreement_record(agr_id: int) -> Optional[Dict[str, str]]:
+    """Fetch a single agreement record by id as a dict."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, agreement_no, name, number, address, date, feasibility_pdf_path, agreement_pdf_path, created_at
+            FROM agreements WHERE id=?
+            """,
+            (agr_id,),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "agreement_no": r[1],
+            "name": r[2],
+            "number": r[3],
+            "address": r[4],
+            "date": r[5],
+            "feasibility_pdf_path": r[6],
+            "agreement_pdf_path": r[7],
+            "created_at": r[8],
+        }
+    finally:
+        conn.close()
+
+
+def delete_agreement(agr_id: int) -> None:
+    """Delete an agreement row and both associated PDFs (feasibility and agreement).
+    This ensures a clean slate so re-creating does not hit UNIQUE/leftover-file issues.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT feasibility_pdf_path, agreement_pdf_path FROM agreements WHERE id=?", (agr_id,))
+        row = cur.fetchone()
+        if row:
+            feas, agrpdf = row
+            # Delete both PDFs if they exist
+            try:
+                if agrpdf and os.path.exists(agrpdf):
+                    os.remove(agrpdf)
+            except Exception:
+                pass
+            try:
+                if feas and os.path.exists(feas):
+                    os.remove(feas)
+            except Exception:
+                pass
+        conn.execute("DELETE FROM agreements WHERE id=?", (agr_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def render_upload_feasibility_tab():
+    st.subheader("Upload PMSG Approval of feasibility")
+    st.caption("Upload only PDF. The file should match the template fields for accurate extraction.")
+    up = st.file_uploader("Upload Feasibility PDF", type=["pdf"], accept_multiple_files=False)
+
+    tags: Dict[str, str] = {}
+    feasibility_pdf_path: Optional[str] = None
+    if up is not None:
+        pdf_bytes = up.read()
+        feasibility_pdf_path = _save_feasibility_pdf(pdf_bytes, up.name)
+
+        cprev, cform = st.columns([3, 2])
+        with cprev:
+            st.markdown("#### Preview: Uploaded Feasibility")
+            try:
+                _render_pdf_preview(feasibility_pdf_path, height=480)
+            except Exception:
+                st.info("Preview not available.")
+
+        text = _read_pdf_text(pdf_bytes)
+        tags = _extract_fields_from_text(text)
+
+        with cform:
+            st.markdown("#### Extracted Fields")
+            st.markdown(f"**Name:** {tags.get('Name','')}")
+            st.markdown(f"**Date:** {tags.get('Date','')}")
+            st.markdown(f"**Phone:** {tags.get('Number','')}")
+            st.text_area("Address:", value=(tags.get("Address", "") or ""), disabled=True, height=120)
+            with st.expander("Debug: raw text (first 1200 chars)", expanded=False):
+                st.code((text or "")[:1200] or "<empty>")
+            st.markdown("---")
+            if st.button("Create Agreement", use_container_width=True):
+                # Use extracted values as-is (no manual editing per requirement)
+                tags = {
+                    "Date": tags.get("Date", ""),
+                    "Name": tags.get("Name", ""),
+                    "Address": tags.get("Address", ""),
+                    "Number": tags.get("Number", ""),
+                }
+                try:
+                    with st.spinner("Generating agreement…"):
+                        _, agr_pdf, agr_no = generate_agreement_pdf(tags, feasibility_pdf_path)
+                except DuplicateAgreementError:
+                    st.error("Duplicate found - Check Generated invoices")
+                    st.caption("An agreement with the same Name, Phone and Address already exists. Please review it in 'Generated Agreement'.")
+                    return
+                if agr_pdf and os.path.exists(agr_pdf):
+                    st.success(f"Agreement generated: {agr_no}")
+                    st.markdown("#### Preview: Agreement")
+                    _render_pdf_preview(agr_pdf, height=480)
+                    with open(agr_pdf, "rb") as f:
+                        st.download_button(
+                            "⬇️  Download Agreement PDF",
+                            data=f.read(),
+                            file_name=os.path.basename(agr_pdf),
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                    _render_mobile_share_button(agr_pdf, os.path.basename(agr_pdf))
+                else:
+                    st.error("Failed to generate agreement PDF. Ensure MS Word or LibreOffice is installed for DOCX→PDF conversion.")
+
+
+def render_generated_agreements_tab():
+    st.subheader("Generated Agreement")
+    df = load_agreements()
+    if df.empty:
+        st.info("No agreements generated yet.")
+        return
+
+    # Filters
+    c1, c2 = st.columns([2, 2])
+    with c1:
+        f_name = st.text_input("Filter by Customer Name", key="agreements_filter_name")
+    with c2:
+        f_id = st.text_input("Filter by Agreement No", key="agreements_filter_id")
+
+    mask = pd.Series([True] * len(df))
+    if f_name:
+        mask &= df["name"].str.contains(f_name, case=False, na=False)
+    if f_id:
+        mask &= df["agreement_no"].astype(str).str.contains(f_id, case=False, na=False)
+    filtered = df[mask].reset_index(drop=True)
+
+    # Query param actions (preview/edit/delete)
+    qp = st.query_params
+    def _first(v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    action = _first(qp.get("g_action"))
+    action_id = _first(qp.get("g_id"))
+    if action and action_id:
+        try:
+            rid = int(action_id)
+            if action == "preview":
+                st.session_state["agr_preview_id"] = rid
+            elif action == "edit":
+                st.session_state["agr_edit_id"] = rid
+                st.session_state.pop("agr_preview_id", None)
+            elif action == "delete":
+                delete_agreement(rid)
+                st.success("Deleted.")
+            st.query_params.clear()
+        except Exception:
+            pass
+
+    mobile_view = st.toggle("Mobile card view", value=True, key="agreements_mobile_card_toggle")
+
+    # Light CSS similar to Search Invoice
+    st.markdown(
+        """
+        <style>
+        .card-title {font-weight:600; margin:0;}
+        .meta {color:#6b7280; font-size:12px; margin: 0;}
+        .stButton>button, .stDownloadButton>button {padding: 0.35rem 0.6rem; border-radius:999px; font-size:13px; min-width: 36px; height: 36px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if mobile_view:
+        for _, row in filtered.iterrows():
+            rid = int(row["id"])
+            pdf_ag = row.get("agreement_pdf_path") if "agreement_pdf_path" in row else None
+            pdf_feas = row.get("feasibility_pdf_path") if "feasibility_pdf_path" in row else None
+            with st.container(border=True):
+                top_l, _ = st.columns([7, 3])
+                with top_l:
+                    st.markdown(f"<p class='card-title'>{row['name']}</p>", unsafe_allow_html=True)
+                    st.markdown(f"<p class='meta'>Agreement No: {row['agreement_no']}</p>", unsafe_allow_html=True)
+
+                # Row 1: Preview buttons
+                p1, p2 = st.columns([1, 1])
+                with p1:
+                    if st.button("👁️  Preview Feasibility", key=f"ga_prev_f_{rid}", use_container_width=True, disabled=not (pdf_feas and os.path.exists(pdf_feas))):
+                        st.session_state["agr_preview_feas_id"] = rid
+                with p2:
+                    if st.button("👁️  Preview Agreement", key=f"ga_prev_a_{rid}", use_container_width=True, disabled=not (pdf_ag and os.path.exists(pdf_ag))):
+                        st.session_state["agr_preview_id"] = rid
+                        st.session_state.pop("agr_preview_feas_id", None)
+
+                # Row 2: Download Feasibility, Download Agreement, Edit, Share, Delete
+                a1, a2, a3, a4, a5 = st.columns([1, 1, 1, 1, 1])
+                with a1:
+                    if pdf_feas and os.path.exists(pdf_feas):
+                        with open(pdf_feas, "rb") as f:
+                            st.download_button("⬇️  Download Feasibility", data=f.read(), file_name=os.path.basename(pdf_feas), mime="application/pdf", key=f"ga_dl_feas_{rid}", use_container_width=True)
+                    else:
+                        st.button("⬇️  Download Feasibility", disabled=True, key=f"ga_dl_feas_na_{rid}", use_container_width=True)
+                with a2:
+                    if pdf_ag and os.path.exists(pdf_ag):
+                        with open(pdf_ag, "rb") as f:
+                            st.download_button("⬇️  Download Agreement", data=f.read(), file_name=os.path.basename(pdf_ag), mime="application/pdf", key=f"ga_dl_ag_{rid}", use_container_width=True)
+                    else:
+                        st.button("⬇️  Download Agreement", disabled=True, key=f"ga_dl_ag_na_{rid}", use_container_width=True)
+                with a3:
+                    if st.button("✏️  Edit", key=f"ga_edit_{rid}", use_container_width=True):
+                        st.session_state["agr_edit_id"] = rid
+                        st.session_state.pop("agr_preview_id", None)
+                        st.session_state.pop("agr_preview_feas_id", None)
+                        st.rerun()
+                with a4:
+                    if pdf_ag and os.path.exists(pdf_ag):
+                        _render_mobile_share_button(pdf_ag, os.path.basename(pdf_ag))
+                    else:
+                        st.button("Share PDF", disabled=True, key=f"ga_share_na_{rid}", use_container_width=True)
+                with a5:
+                    if st.button("🗑️  Delete", key=f"ga_del_{rid}", use_container_width=True):
+                        # Clear state to avoid referencing a deleted record then rerun
+                        st.session_state.pop("agr_preview_id", None)
+                        st.session_state.pop("agr_preview_feas_id", None)
+                        st.session_state.pop("agr_edit_id", None)
+                        delete_agreement(rid)
+                        st.success("Deleted.")
+                        st.rerun()
+
+                # Inline previews (full-width inside this card)
+                if st.session_state.get("agr_preview_feas_id") == rid and pdf_feas and os.path.exists(pdf_feas):
+                    _render_pdf_preview(pdf_feas, height=780)
+                    if st.button("Close Feasibility preview", key=f"ga_close_prev_f_{rid}"):
+                        st.session_state.pop("agr_preview_feas_id", None)
+                        st.rerun()
+                if st.session_state.get("agr_preview_id") == rid and pdf_ag and os.path.exists(pdf_ag):
+                    _render_pdf_preview(pdf_ag, height=780)
+                    if st.button("Close Agreement preview", key=f"ga_close_prev_{rid}"):
+                        st.session_state.pop("agr_preview_id", None)
+                        st.rerun()
+
+                # Inline edit panel
+                if st.session_state.get("agr_edit_id") == rid:
+                    st.markdown("#### Edit Agreement")
+                    rec = fetch_agreement_record(rid) or {}
+                    c_cancel, _ = st.columns([1, 6])
+                    with c_cancel:
+                        if st.button("Close", key=f"ga_close_edit_{rid}"):
+                            st.session_state.pop("agr_edit_id", None)
+                            st.rerun()
+                    with st.form(key=f"ga_edit_form_{rid}"):
+                        name = st.text_input("Name", value=rec.get("name", ""))
+                        number = st.text_input("Phone", value=rec.get("number", ""))
+                        date = st.text_input("Date (DD-MM-YYYY)", value=rec.get("date", ""))
+                        address = st.text_area("Address", value=rec.get("address", ""), height=100)
+                        submitted = st.form_submit_button("Save & Regenerate")
+                    if submitted:
+                        new_tags = {"Name": name.strip(), "Number": number.strip(), "Date": date.strip(), "Address": address.strip()}
+                        with st.spinner("Regenerating…"):
+                            pdf = edit_agreement(rid, new_tags)
+                        if pdf and os.path.exists(pdf):
+                            st.success("Agreement updated.")
+                            st.rerun()
+        return
+
+    # Desktop-like layout (header + rows)
+    h1, h2, h3, h4, h5 = st.columns([2.5, 2.5, 2, 2, 2])
+    with h1:
+        st.markdown("**Customer**")
+    with h2:
+        st.markdown("**Agreement No**")
+    with h3:
+        st.markdown("**Date**")
+    with h4:
+        st.markdown("**Phone**")
+    with h5:
+        st.markdown("**Action**")
+
+    for _, row in filtered.iterrows():
+        rid = int(row["id"])
+        pdf_ag = row.get("agreement_pdf_path") if "agreement_pdf_path" in row else None
+        pdf_feas = row.get("feasibility_pdf_path") if "feasibility_pdf_path" in row else None
+        c1, c2, c3, c4, c5 = st.columns([2.5, 2.5, 2, 2, 2])
+        with c1:
+            st.write(row["name"])  
+        with c2:
+            st.write(row["agreement_no"]) 
+        with c3:
+            st.write(row.get("date", "")) 
+        with c4:
+            st.write(row.get("number", "")) 
+        with c5:
+            a1, a2, a3, a4, a5 = st.columns([1, 1, 1, 1, 1])
+            with a1:
+                # Preview both (Agreement prioritized), then Feasibility below inline
+                if st.button("👁️", key=f"ga_d_prev_{rid}", use_container_width=True):
+                    st.session_state["agr_preview_id"] = rid
+            with a2:
+                if pdf_feas and os.path.exists(pdf_feas):
+                    with open(pdf_feas, "rb") as f:
+                        st.download_button("⬇️ F", f.read(), file_name=os.path.basename(pdf_feas), key=f"ga_d_dl_f_{rid}", use_container_width=True)
+                else:
+                    st.button("⬇️ F", disabled=True, key=f"ga_d_dl_f_na_{rid}", use_container_width=True)
+            with a3:
+                if pdf_ag and os.path.exists(pdf_ag):
+                    with open(pdf_ag, "rb") as f:
+                        st.download_button("⬇️ A", f.read(), file_name=os.path.basename(pdf_ag), key=f"ga_d_dl_a_{rid}", use_container_width=True)
+                else:
+                    st.button("⬇️ A", disabled=True, key=f"ga_d_dl_a_na_{rid}", use_container_width=True)
+            with a4:
+                if st.button("✏️", key=f"ga_d_edit_{rid}", use_container_width=True):
+                    st.session_state["agr_edit_id"] = rid
+                    st.session_state.pop("agr_preview_id", None)
+                    st.rerun()
+            with a5:
+                if st.button("🗑️", key=f"ga_d_del_{rid}", use_container_width=True):
+                    st.session_state.pop("agr_preview_id", None)
+                    st.session_state.pop("agr_edit_id", None)
+                    delete_agreement(rid)
+                    st.success("Deleted.")
+                    st.rerun()
+
+        # Inline previews (full-width below row)
+        if st.session_state.get("agr_preview_id") == rid:
+            if pdf_feas and os.path.exists(pdf_feas):
+                st.markdown("Feasibility Preview")
+                _render_pdf_preview(pdf_feas, height=780)
+            if pdf_ag and os.path.exists(pdf_ag):
+                st.markdown("Agreement Preview")
+                _render_pdf_preview(pdf_ag, height=780)
+            if st.button("Close preview", key=f"ga_d_close_prev_{rid}"):
+                st.session_state.pop("agr_preview_id", None)
+                st.rerun()
+
+        if st.session_state.get("agr_edit_id") == rid:
+            st.markdown("#### Edit Agreement")
+            rec = fetch_agreement_record(rid) or {}
+            c_cancel, _ = st.columns([1, 6])
+            with c_cancel:
+                if st.button("Close", key=f"ga_d_close_edit_{rid}"):
+                    st.session_state.pop("agr_edit_id", None)
+                    st.rerun()
+            with st.form(key=f"ga_d_edit_form_{rid}"):
+                name = st.text_input("Name", value=rec.get("name", ""))
+                number = st.text_input("Phone", value=rec.get("number", ""))
+                date = st.text_input("Date (DD-MM-YYYY)", value=rec.get("date", ""))
+                address = st.text_area("Address", value=rec.get("address", ""), height=100)
+                submitted = st.form_submit_button("Save & Regenerate")
+            if submitted:
+                new_tags = {"Name": name.strip(), "Number": number.strip(), "Date": date.strip(), "Address": address.strip()}
+                with st.spinner("Regenerating…"):
+                    pdf = edit_agreement(rid, new_tags)
+                if pdf and os.path.exists(pdf):
+                    st.success("Agreement updated.")
+                    st.rerun()
 # ---------------------------
 # Streamlit UI
 # ---------------------------
@@ -1319,7 +2242,13 @@ def main():
     ensure_dirs()
     _ = get_conn()  # ensure DB exists
 
-    tabs = st.tabs(["Dashboard", "Create Invoice", "Search Invoice", "Upload PMSG Approval of Feasibility", "Generated Agreement"])
+    tabs = st.tabs([
+        "Dashboard",
+        "Create Invoice",
+        "Upload PMSG Approval of feasibility",
+        "Generated Agreement",
+        "Search Invoice",
+    ])
 
     with tabs[0]:
         render_dashboard()
@@ -1349,13 +2278,13 @@ def main():
         )
 
     with tabs[2]:
-        render_search_tab()
+        render_upload_feasibility_tab()
 
     with tabs[3]:
-        render_feasibility_upload_tab()
+        render_generated_agreements_tab()
 
     with tabs[4]:
-        render_agreements_list_tab()
+        render_search_tab()
 
 
 # ---------------------------
@@ -1474,6 +2403,73 @@ def render_dashboard():
         st.metric("Unique Customers", int(unique_customers))
     with m4:
         st.metric("With PDF", total_with_pdf)
+
+    # Agreements & Feasibility section (date-wise, same range controls)
+    st.markdown("### Agreements & Feasibility")
+
+    # Helper: robust date parse for agreement.created_at (iso) and agreement.date (varied)
+    def _to_date_any(x):
+        if x is None:
+            return None
+        t = str(x).strip()
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(t, fmt).date()
+            except Exception:
+                pass
+        try:
+            return datetime.fromisoformat(t).date()
+        except Exception:
+            return None
+
+    # Agreements created count by created_at within range
+    conn = get_conn()
+    try:
+        df_ag = pd.read_sql_query(
+            """
+            SELECT id, created_at FROM agreements ORDER BY id DESC
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    if not df_ag.empty:
+        df_ag["created_date"] = df_ag["created_at"].apply(_to_date_any)
+        df_ag_valid = df_ag.dropna(subset=["created_date"]).copy()
+        if start_date and end_date:
+            mask_ag = (df_ag_valid["created_date"] >= start_date) & (df_ag_valid["created_date"] <= end_date)
+            df_ag_view = df_ag_valid[mask_ag]
+        else:
+            df_ag_view = df_ag_valid
+        agreements_in_range = len(df_ag_view)
+    else:
+        agreements_in_range = 0
+
+    # Feasibility uploads count from filesystem (by file modified time)
+    feas_in_range = 0
+    try:
+        if os.path.isdir(FEASIBILITY_DIR):
+            for name in os.listdir(FEASIBILITY_DIR):
+                if not name.lower().endswith(".pdf"):
+                    continue
+                fpath = os.path.join(FEASIBILITY_DIR, name)
+                try:
+                    dt = datetime.fromtimestamp(os.path.getmtime(fpath)).date()
+                    if start_date and end_date:
+                        if start_date <= dt <= end_date:
+                            feas_in_range += 1
+                    else:
+                        feas_in_range += 1
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    cfa, cag = st.columns(2)
+    with cfa:
+        st.metric("Feasibility Uploaded (range)", feas_in_range)
+    with cag:
+        st.metric("Agreements Created (range)", agreements_in_range)
 
     # Quick glance mini-counters
     def count_in(d0, d1):
@@ -1618,441 +2614,76 @@ def render_create_form(
         elif edit_id is not None and prefill and prefill.get("quotation_no"):
             st.text_input("Quotation No", value=prefill.get("quotation_no"), disabled=True, key=f"{ns}_qno_edit")
 
-        submitted = st.form_submit_button("Create Invoice" if edit_id is None else "Update Invoice")
+        submit_label = "Update Invoice" if edit_id is not None else "Create Invoice"
+        submitted = st.form_submit_button(submit_label)
 
-        if submitted:
-            # Validate required fields
-            if not customer_name.strip():
-                st.error("Customer Name is required.")
-                return
-            if not mobile.strip():
-                st.error("Mobile Number is required.")
-                return
-            if not location.strip():
-                st.error("Location is required.")
-                return
-
-            data = {
-                "product": product,
-                "customer_name": customer_name,
-                "mobile": mobile,
-                "location": location,
-                "city": city,
-                "state": state,
-                "pincode": pincode,
-                "staff_name": staff_name,
-                "date_of_quotation": date_of_quotation.isoformat(),
-                "validity_date": validity_date.isoformat(),
-            }
-
-            # Minimal progress UI (non-intrusive)
-            prog = st.progress(0, text="Starting…")
-            status = st.empty()
-            try:
-                prog.progress(10, text="Processing invoice…")
-                status.write("Generating files…")
-                # choose template based on selected product
-                template_path = _template_for_product(product)
-                if edit_id is None:
-                    docx_path, pdf_path = create_invoice(data, template_path)
-                    prog.progress(70, text="Finalizing creation…")
-                    st.success("Invoice created successfully.")
-                    st.toast(f"Saved invoice {qno_preview}", icon="✅")
-                else:
-                    docx_path, pdf_path = edit_invoice(edit_id, data, template_path)
-                    prog.progress(70, text="Finalizing update…")
-                    st.success("Invoice updated successfully.")
-                    st.toast("Invoice updated", icon="✏️")
-                if pdf_path and os.path.exists(pdf_path):
-                    # Inline preview of the generated PDF
-                    _render_pdf_preview(pdf_path, height=480)
-                    # Actions: Download + Share side-by-side
-                    cdl, csh = st.columns([1, 1])
-                    with cdl:
-                        with open(pdf_path, "rb") as f:
-                            prog.progress(90, text="Preparing download…")
-                            st.download_button(
-                                "⬇️  Download",
-                                data=f.read(),
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf",
-                                use_container_width=True,
-                            )
-                    with csh:
-                        _render_mobile_share_button(pdf_path, os.path.basename(pdf_path))
-                    prog.progress(100, text="Done")
-                else:
-                    prog.progress(100, text="Completed (PDF unavailable)")
-                    if docx_path and isinstance(docx_path, str) and os.path.exists(docx_path):
-                        st.warning("PDF conversion failed. Download the DOCX and export to PDF using Word/LibreOffice. You can also install LibreOffice or MS Word to enable automatic PDF generation.")
-                        with open(docx_path, "rb") as f:
-                            st.download_button(
-                                "⬇️  Download DOCX",
-                                data=f.read(),
-                                file_name=os.path.basename(docx_path),
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                use_container_width=True,
-                            )
-                        st.caption("Tip: On Windows, installing MS Word usually enables automatic PDF conversion via docx2pdf. Alternatively, install LibreOffice and set environment variable LIBREOFFICE_PATH to the soffice.exe.")
-                    else:
-                        st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word or LibreOffice installed.")
-            except Exception as e:
-                prog.progress(100, text="Failed")
-                st.error(f"Failed to process invoice: {e}")
-
-
-# ---------------------------
-# Feasibility upload and Agreement tabs (new feature)
-# ---------------------------
-
-def _agreements_init(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agreements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agreement_no TEXT UNIQUE NOT NULL,
-            customer_name TEXT,
-            mobile TEXT,
-            address TEXT,
-            date TEXT,
-            feasibility_path TEXT,
-            agreement_pdf_path TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        )
-        """
-    )
-    conn.commit()
-
-
-def _save_uploaded_pdf(uploaded_file, dest_dir: str, base_name: str) -> Optional[str]:
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-        safe_base = safe_filename(base_name)
-        if not safe_base:
-            import uuid as _uuid
-            safe_base = _uuid.uuid4().hex
-        out_path = os.path.join(dest_dir, f"{safe_base}.pdf")
-        with open(out_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return out_path if os.path.exists(out_path) else None
-    except Exception:
-        return None
-
-
-def _extract_feasibility_fields(pdf_path: str) -> Dict[str, str]:
-    """Extract Date, Name, Mobile No, and Address from feasibility PDF.
-    Tries pdfplumber first; falls back to pypdf if pdfplumber is unavailable on server.
-    """
-    import re
-
-    def _extract_with_regex(full_text: str) -> Dict[str, str]:
-        extracted: Dict[str, str] = {"Date": "", "Name": "", "Number": "", "Address": ""}
-        # Date patterns
-        date_patterns = [
-            r"Date[:\s]*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})",
-            r"Date[:\s]*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2})",
-            r"([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})",
-        ]
-        for pattern in date_patterns:
-            m = re.search(pattern, full_text, re.IGNORECASE)
-            if m:
-                extracted["Date"] = m.group(1).strip()
-                break
-
-        # Name
-        name_patterns = [
-            r"Name of Applicant[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
-            r"Applicant[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
-            r"Name[:\s]*([A-Za-z\s]+?)(?:\n|Mobile|Address|$)",
-        ]
-        for pattern in name_patterns:
-            m = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
-            if m:
-                name = re.sub(r"[^A-Za-z\s]", "", m.group(1)).strip()
-                if len(name) > 2:
-                    extracted["Name"] = name
-                    break
-
-        # Mobile
-        mobile_patterns = [
-            r"Mobile No[:\s]*([0-9]{10,12})",
-            r"Mobile[:\s]*([0-9]{10,12})",
-            r"Phone[:\s]*([0-9]{10,12})",
-            r"([0-9]{10})",
-        ]
-        for pattern in mobile_patterns:
-            m = re.search(pattern, full_text, re.IGNORECASE)
-            if m:
-                extracted["Number"] = m.group(1).strip()
-                break
-
-        # Address
-        address_patterns = [
-            r"([A-Za-z0-9\-,\s]+),\s*District:\s*([A-Za-z\s]+),\s*State:\s*([A-Z\s]+),\s*PIN\s*Code:\s*([0-9]+)",
-            r"Address of Premises for Installation[:\s]*\n?\s*([^\n]+)",
-            r"Installation[:\s]*\n?\s*([A-Za-z0-9\-,\s]+(?:,\s*[A-Za-z\s]+)*)",
-        ]
-        for pattern in address_patterns:
-            m = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
-            if m:
-                if len(m.groups()) == 4:
-                    address = f"{m.group(1).strip()}, District: {m.group(2).strip()}, State: {m.group(3).strip()}, PIN Code: {m.group(4).strip()}"
-                else:
-                    address = m.group(1).strip()
-                address = re.sub(r"\s+", " ", address)
-                address = re.sub(r"[^A-Za-z0-9\s,.:-]", "", address)
-                if len(address) > 5:
-                    extracted["Address"] = address
-                    break
-        return extracted
-
-    # Try pdfplumber first
-    try:
-        import pdfplumber  # type: ignore
-        full_text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                if t:
-                    full_text += t + "\n"
-        if full_text.strip():
-            return _extract_with_regex(full_text)
-    except Exception as e:
-        print(f"pdfplumber unavailable/failed: {e}")
-
-    # Fallback: pypdf
-    try:
-        from pypdf import PdfReader  # type: ignore
-        reader = PdfReader(pdf_path)
-        texts: List[str] = []
-        for page in reader.pages:
-            try:
-                texts.append(page.extract_text() or "")
-            except Exception:
-                pass
-        full_text = "\n".join(texts)
-        if full_text.strip():
-            return _extract_with_regex(full_text)
-    except Exception as e:
-        print(f"pypdf fallback failed: {e}")
-
-    return {"Date": "", "Name": "", "Number": "", "Address": ""}
-
-
-def _generate_agreement_docx(data: Dict[str, str]) -> io.BytesIO:
-    """Generate agreement DOCX from template with extracted data"""
-    try:
-        from docx import Document
-        
-        template_path = os.path.join("templates", "agreement template.docx")
-        if not os.path.exists(template_path):
-            raise FileNotFoundError(f"Agreement template not found: {template_path}")
-        
-        doc = Document(template_path)
-        
-        # Replace placeholders in all paragraphs and tables
-        replacements = {
-            "[Date]": data.get("Date", ""),
-            "[Name]": data.get("Name", ""),
-            "[Number]": data.get("Number", ""),
-            "[Address]": data.get("Address", "")
+    if submitted:
+        data = {
+            "product": product,
+            "customer_name": customer_name.strip(),
+            "mobile": str(mobile).strip(),
+            "location": location.strip(),
+            "city": city.strip(),
+            "state": state.strip(),
+            "pincode": str(pincode).strip(),
+            "staff_name": staff_name.strip(),
+            "date_of_quotation": date_of_quotation.isoformat(),
+            "validity_date": validity_date.isoformat(),
         }
-        
-        # Replace in paragraphs
-        for paragraph in doc.paragraphs:
-            for placeholder, value in replacements.items():
-                if placeholder in paragraph.text:
-                    for run in paragraph.runs:
-                        if placeholder in run.text:
-                            run.text = run.text.replace(placeholder, str(value))
-        
-        # Replace in tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        for placeholder, value in replacements.items():
-                            if placeholder in paragraph.text:
-                                for run in paragraph.runs:
-                                    if placeholder in run.text:
-                                        run.text = run.text.replace(placeholder, str(value))
-        
-        # Save to BytesIO
-        bio = io.BytesIO()
-        doc.save(bio)
-        bio.seek(0)
-        return bio
-        
-    except Exception as e:
-        raise Exception(f"Failed to generate agreement DOCX: {e}")
-
-
-def render_feasibility_upload_tab() -> None:
-    st.subheader("Upload PMSG Approval of Feasibility")
-    up = st.file_uploader("Upload feasibility PDF", type=["pdf"], key="feas_up")
-    if not up:
-        st.info("Upload a PDF to begin.")
-        return
-
-    # Save uploaded feasibility
-    feas_path = _save_uploaded_pdf(up, os.path.join(OUTPUT_DIR, "feasibility"), f"feas-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-    if not feas_path:
-        st.error("Failed to save uploaded file.")
-        return
-
-    st.markdown("**Feasibility Preview**")
-    _render_pdf_preview(feas_path, height=480)
-
-    # Extract fields automatically from PDF
-    extracted = _extract_feasibility_fields(feas_path)
-    # Diagnostics: show which extractor is active
-    try:
-        import pdfplumber as _pp  # noqa: F401
-        st.caption("Extractor: pdfplumber")
-    except Exception:
+        # Minimal progress UI (non-intrusive)
+        prog = st.progress(0, text="Starting…")
+        status = st.empty()
         try:
-            from pypdf import PdfReader  # noqa: F401
-            st.caption("Extractor: pypdf fallback")
-        except Exception:
-            st.caption("Extractor: unavailable (no pdfplumber/pypdf)")
-    
-    # Show extracted values (read-only display)
-    if any(extracted.values()):
-        st.markdown("**Extracted Information:**")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.text_input("Date", value=extracted.get("Date", ""), disabled=True)
-            st.text_input("Name", value=extracted.get("Name", ""), disabled=True)
-        with col2:
-            st.text_input("Mobile Number", value=extracted.get("Number", ""), disabled=True)
-            st.text_area("Address", value=extracted.get("Address", ""), disabled=True, height=100)
-    else:
-        st.warning("Could not extract information from PDF. Please ensure the PDF follows the expected format.")
-        return
-
-    if st.button("Create Agreement", key="btn_create_agreement", type="primary"):
-        conn = get_conn()
-        try:
-            _agreements_init(conn)
-            # Determine next agreement number (fallback if helper missing)
-            try:
-                agr_no = next_agreement_no(conn)  # type: ignore
-            except Exception:
-                cur = conn.cursor()
-                cur.execute("SELECT agreement_no FROM agreements ORDER BY id DESC LIMIT 1")
-                row = cur.fetchone()
-                if row and isinstance(row[0], str) and row[0].split("/")[-1].isdigit():
-                    agr_no = f"AGR/25-26/{int(row[0].split('/')[-1])+1:04d}"
-                else:
-                    agr_no = "AGR/25-26/0001"
-
-            # Generate agreement DOCX using extracted data
-            try:
-                data = {"Date": extracted.get("Date", ""), "Name": extracted.get("Name", ""), "Number": extracted.get("Number", ""), "Address": extracted.get("Address", "")}
-                docx_bytes = _generate_agreement_docx(data)
-            except Exception as e:
-                st.error(f"Failed to generate agreement: {e}")
-                return
-
-            # Use same pattern as create_invoice function
-            base = safe_filename(agr_no)
-            
-            # Save DOCX temporarily (same as invoice creation)
-            temp_docx = os.path.join(DOCX_DIR, f"{base}.docx")
-            try:
-                if os.path.exists(temp_docx):
-                    os.remove(temp_docx)
-            except Exception:
-                pass
-            with open(temp_docx, "wb") as f:
-                f.write(docx_bytes.getvalue())
-            
-            # Convert to PDF (same as invoice creation)
-            target_pdf = os.path.join(AGREEMENTS_DIR, f"{base}.pdf")
-            try:
-                if os.path.exists(target_pdf):
-                    os.remove(target_pdf)
-            except Exception:
-                pass
-            
-            pdf_res = convert_to_pdf(temp_docx, target_pdf)
-            
-            
-            # Always delete temporary DOCX (same as invoice creation)
-            try:
-                if os.path.exists(temp_docx):
-                    os.remove(temp_docx)
-            except Exception:
-                pass
-            
-            final_pdf_path = pdf_res
-
-            now = datetime.now().isoformat(timespec="seconds")
-            conn.execute(
-                """
-                INSERT INTO agreements (agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (agr_no, extracted.get("Name", ""), extracted.get("Number", ""), extracted.get("Address", ""), extracted.get("Date", ""), feas_path, final_pdf_path, now, now),
-            )
-            conn.commit()
-
-            st.success(f"Agreement created: {agr_no}")
-            
-            if final_pdf_path and os.path.exists(final_pdf_path):
-                st.markdown("**Agreement Preview**")
-                _render_pdf_preview(final_pdf_path, height=480)
-                with open(final_pdf_path, "rb") as f:
-                    st.download_button("⬇️  Download Agreement PDF", data=f.read(), file_name=os.path.basename(final_pdf_path), mime="application/pdf")
+            prog.progress(10, text="Processing invoice…")
+            status.write("Generating files…")
+            # choose template based on selected product
+            template_path = _template_for_product(product)
+            if edit_id is None:
+                docx_path, pdf_path = create_invoice(data, template_path)
+                prog.progress(70, text="Finalizing creation…")
+                st.success("Invoice created successfully.")
+                st.toast(f"Saved invoice {qno_preview}", icon="✅")
             else:
-                st.warning("PDF conversion failed. Please check if MS Word or LibreOffice is installed for automatic PDF conversion.")
-        finally:
-            conn.close()
-
-
-def render_agreements_list_tab() -> None:
-    st.subheader("Generated Agreement")
-    conn = get_conn()
-    try:
-        _agreements_init(conn)
-        df = pd.read_sql_query(
-            "SELECT id, agreement_no, customer_name, mobile, address, date, feasibility_path, agreement_pdf_path FROM agreements ORDER BY id DESC",
-            conn,
-        )
-    finally:
-        conn.close()
-
-    if df.empty:
-        st.info("No agreements yet.")
-        return
-
-    for _, row in df.iterrows():
-        with st.container(border=True):
-            st.markdown(f"**{row['agreement_no']}** — {row['customer_name']}")
-            c1, c2, c3, c4 = st.columns(4)
-            feas = row.get("feasibility_path")
-            agr = row.get("agreement_pdf_path")
-            with c1:
-                if feas and os.path.exists(feas) and st.button("Preview Feasibility", key=f"pf_{row['id']}"):
-                    _render_pdf_preview(feas, height=360)
-            with c2:
-                if agr and os.path.exists(agr) and st.button("Preview Agreement", key=f"pa_{row['id']}"):
-                    _render_pdf_preview(agr, height=360)
-            with c3:
-                if feas and os.path.exists(feas):
-                    with open(feas, "rb") as f:
-                        st.download_button("Download Feasibility", data=f.read(), file_name=os.path.basename(feas), key=f"df_{row['id']}")
+                docx_path, pdf_path = edit_invoice(edit_id, data, template_path)
+                prog.progress(70, text="Finalizing update…")
+                st.success("Invoice updated successfully.")
+                st.toast("Invoice updated", icon="✏️")
+            if pdf_path and os.path.exists(pdf_path):
+                # Inline preview of the generated PDF
+                _render_pdf_preview(pdf_path, height=480)
+                # Actions: Download + Share side-by-side
+                cdl, csh = st.columns([1, 1])
+                with cdl:
+                    with open(pdf_path, "rb") as f:
+                        prog.progress(90, text="Preparing download…")
+                        st.download_button(
+                            "⬇️  Download",
+                            data=f.read(),
+                            file_name=os.path.basename(pdf_path),
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                with csh:
+                    _render_mobile_share_button(pdf_path, os.path.basename(pdf_path))
+                prog.progress(100, text="Done")
+            else:
+                prog.progress(100, text="Completed (PDF unavailable)")
+                if docx_path and isinstance(docx_path, str) and os.path.exists(docx_path):
+                    st.warning("PDF conversion failed. Download the DOCX and export to PDF using Word/LibreOffice. You can also install LibreOffice or MS Word to enable automatic PDF generation.")
+                    with open(docx_path, "rb") as f:
+                        st.download_button(
+                            "⬇️  Download DOCX",
+                            data=f.read(),
+                            file_name=os.path.basename(docx_path),
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+                    st.caption("Tip: On Windows, installing MS Word usually enables automatic PDF conversion via docx2pdf. Alternatively, install LibreOffice and set environment variable LIBREOFFICE_PATH to the soffice.exe.")
                 else:
-                    st.button("Download Feasibility", disabled=True, key=f"dfx_{row['id']}")
-            with c4:
-                if agr and os.path.exists(agr):
-                    with open(agr, "rb") as f:
-                        st.download_button("Download Agreement", data=f.read(), file_name=os.path.basename(agr), key=f"da_{row['id']}")
-                else:
-                    st.button("Download Agreement", disabled=True, key=f"dax_{row['id']}")
-
-    # End of Generated Agreement list
+                    st.warning("PDF conversion failed or Word is not available. Please try again on a system with MS Word or LibreOffice installed.")
+        except Exception as e:
+            prog.progress(100, text="Failed")
+            st.error(f"Failed to process invoice: {e}")
 
 
 def render_search_tab():
@@ -2301,6 +2932,14 @@ def render_search_tab():
                     st.success("Deleted.")
                     st.rerun()
 
+        # Inline preview right under the targeted row (desktop view), same as mobile behavior
+        if st.session_state.get("preview_id") == rid and pdf_path and os.path.exists(pdf_path):
+            with st.container():
+                _render_pdf_preview(pdf_path, height=480)
+                if st.button("Close preview", key=f"d_close_preview_{rid}"):
+                    st.session_state.pop("preview_id", None)
+                    st.rerun()
+
         # Inline share prompt removed; Share PDF is now directly in the action row (desktop view)
 
         # Inline edit panel right under the targeted row (desktop view), same as mobile behavior
@@ -2308,6 +2947,14 @@ def render_search_tab():
             with st.container():
                 st.markdown("#### Edit Invoice")
                 prefill = fetch_full_record(rid) or {}
+                c_cancel, _ = st.columns([1, 6])
+                with c_cancel:
+                    if st.button("Close", key=f"d_close_edit_{rid}"):
+                        st.session_state.pop("selected_edit_id", None)
+                        st.rerun()
+                render_create_form(prefill=prefill, edit_id=rid)
+
+    # Global preview/edit panels are intentionally removed for desktop table view to keep UI inline per row
 
 
 def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
@@ -2341,4 +2988,3 @@ def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
 
 if __name__ == "__main__":
     main()
-
