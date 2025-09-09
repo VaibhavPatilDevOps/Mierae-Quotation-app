@@ -1997,17 +1997,36 @@ def render_generated_agreements_tab():
         return
 
     # Filters
-    c1, c2 = st.columns([2, 2])
+    c1, c2, c3 = st.columns([2, 2, 3])
     with c1:
         f_name = st.text_input("Filter by Customer Name", key="agreements_filter_name")
     with c2:
         f_id = st.text_input("Filter by Agreement No", key="agreements_filter_id")
+    with c3:
+        apply_date = st.checkbox("Filter by Created Date range", value=False, key="agreements_filter_date_toggle")
+        start_date, end_date = None, None
+        if apply_date:
+            today = datetime.now().date()
+            default_start = today - timedelta(days=30)
+            dr = st.date_input("Created date range", value=(default_start, today), key="agreements_filter_date_range")
+            if isinstance(dr, tuple) and len(dr) == 2:
+                start_date, end_date = dr
+            else:
+                start_date = dr
+                end_date = dr
 
     mask = pd.Series([True] * len(df))
     if f_name:
         mask &= df["name"].str.contains(f_name, case=False, na=False)
     if f_id:
         mask &= df["agreement_no"].astype(str).str.contains(f_id, case=False, na=False)
+    # Date filter on created_at
+    if apply_date and (start_date is not None) and (end_date is not None) and not df.empty:
+        try:
+            created = pd.to_datetime(df["created_at"], errors="coerce").dt.date
+            mask &= (created >= start_date) & (created <= end_date)
+        except Exception:
+            pass
     filtered = df[mask].reset_index(drop=True)
 
     # Query param actions (preview/edit/delete)
@@ -2302,8 +2321,11 @@ def render_dashboard():
         conn.close()
 
     if df.empty:
-        st.info("No invoices yet.")
-        return
+        st.info("No invoices yet. Showing Agreements & Feasibility stats if available.")
+        # Create an empty frame with expected columns to keep downstream logic intact
+        df = pd.DataFrame(columns=[
+            "id", "customer_name", "product", "date_of_quotation", "quotation_no", "pdf_path", "created_at"
+        ])
 
     # Normalize dates
     def to_date(x):
