@@ -2242,49 +2242,30 @@ def main():
     ensure_dirs()
     _ = get_conn()  # ensure DB exists
 
-    tabs = st.tabs([
-        "Dashboard",
-        "Create Invoice",
-        "Upload PMSG Approval of feasibility",
-        "Generated Agreement",
-        "Search Invoice",
-    ])
+    # Sidebar navigation drawer
+    st.sidebar.title("Navigation")
+    section = st.sidebar.radio("Menu", ["Dashboard", "Invoice", "Agreement"], index=0)
 
-    with tabs[0]:
+    if section == "Dashboard":
         render_dashboard()
 
-    # with tabs[1]:
-    #     # Create (3.3 kW) – restrict to only 3.3 product and use 3.3 template
-    #     render_create_form(
-    #         allowed_products=["3.3 kW Residential Rooftop Solar System"],
-    #         form_title="Create Invoice (3.3 kW)",
-    #         key_ns="kw33",
-    #     )
+    elif section == "Invoice":
+        tabs = st.tabs(["Create Invoice", "Search Invoice"])
+        with tabs[0]:
+            render_create_form(
+                allowed_products=PRODUCT_OPTIONS,
+                form_title="Create Invoice",
+                key_ns="kwall",
+            )
+        with tabs[1]:
+            render_search_tab()
 
-    # with tabs[2]:
-    #     # Create (5.5 kW) – restrict to only 5.5 product and use 5.5 template
-    #     render_create_form(
-    #         allowed_products=["5.5 kW Residential Rooftop Solar System"],
-    #         form_title="Create Invoice (5.5 kW)",
-    #         key_ns="kw55",
-    #     )
-
-    with tabs[1]:
-        # Create (Both) – allow choosing either product; template auto-selected
-        render_create_form(
-            allowed_products=PRODUCT_OPTIONS,
-            form_title="Create Invoice",
-            key_ns="kwall",
-        )
-
-    with tabs[2]:
-        render_upload_feasibility_tab()
-
-    with tabs[3]:
-        render_generated_agreements_tab()
-
-    with tabs[4]:
-        render_search_tab()
+    elif section == "Agreement":
+        tabs = st.tabs(["Upload PMSG Approval of feasibility", "Generated Agreement"])
+        with tabs[0]:
+            render_upload_feasibility_tab()
+        with tabs[1]:
+            render_generated_agreements_tab()
 
 
 # ---------------------------
