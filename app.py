@@ -72,6 +72,8 @@ def get_conn() -> sqlite3.Connection:
             staff_name TEXT,
             date_of_quotation TEXT,
             validity_date TEXT,
+            application_reference TEXT,
+            electricity_connection_no TEXT,
             docx_path TEXT,
             pdf_path TEXT,
             created_at TEXT,
@@ -79,6 +81,16 @@ def get_conn() -> sqlite3.Connection:
         )
         """
     )
+    # Safe migration for older databases: add missing columns if necessary
+    try:
+        cur = conn.execute("PRAGMA table_info(invoices)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "application_reference" not in cols:
+            conn.execute("ALTER TABLE invoices ADD COLUMN application_reference TEXT")
+        if "electricity_connection_no" not in cols:
+            conn.execute("ALTER TABLE invoices ADD COLUMN electricity_connection_no TEXT")
+    except Exception:
+        pass
     # New: agreements table to store feasibility uploads and generated agreements
     conn.execute(
         """
@@ -514,6 +526,9 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
         "date of quotation": fmt_date(data.get("date_of_quotation", "")),
         "validity of quotation": fmt_date(data.get("validity_date", "")),
         "quotation no": str(data.get("quotation_no", "")),
+        # New fields
+        "application reference": data.get("application_reference", ""),
+        "electricity connection no": data.get("electricity_connection_no", ""),
     }
 
     # Labels for which we should remove the title text (customer info block only)
@@ -563,13 +578,53 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
             try:
                 if r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
                     if not replaced:
-                        r.text = "" if value is None else str(value)
+                        # Add a trailing space for specific labels that are followed by another label on the same line
+                        if value is None:
+                            r.text = ""
+                        else:
+                            val_txt = str(value)
+                            if label in ("application reference", "electricity connection no") and not val_txt.endswith(" "):
+                                val_txt = val_txt + " "
+                            r.text = val_txt
                         replaced = True
                     else:
                         # clear leftover highlighted placeholders in this label's region
                         r.text = ""
             except Exception:
                 pass
+
+        # Fallback when there are no highlighted placeholders: replace 'N/A' or set first run after label
+        if not replaced and value:
+            pos = 0
+            fallback_done = False
+            for r in p.runs:
+                rt = r.text
+                begin = pos
+                end = pos + len(rt)
+                pos = end
+                if end <= label_end:
+                    continue
+                if begin >= next_idx:
+                    break
+                if "N/A" in rt or "n/a" in rt.lower() or rt.strip() == "":
+                    try:
+                        val_txt = str(value)
+                        if label in ("application reference", "electricity connection no") and not val_txt.endswith(" "):
+                            val_txt = val_txt + " "
+                        r.text = val_txt
+                        fallback_done = True
+                        break
+                    except Exception:
+                        pass
+            if not fallback_done:
+                # As last resort, append the value at end of paragraph
+                try:
+                    val_txt = str(value)
+                    if label in ("application reference", "electricity connection no") and not val_txt.endswith(" "):
+                        val_txt = val_txt + " "
+                    p.add_run(" " + val_txt)
+                except Exception:
+                    pass
 
         # Second pass: remove the label text portion itself ONLY for customer info labels
         if label in STRIP_LABELS:
@@ -654,12 +709,60 @@ def replace_by_labels(doc: DocxDocument, data: Dict[str, str]) -> None:
         for label, value in targets.items():
             replace_in_paragraph(p, label, value, label_list)
 
+        # Ensure a visible gap before right-side labels when they appear in the same paragraph
+        # (seen in the 3.3 kW template where 'Application Reference' and 'Date of Quotation' can share a line)
+        try:
+            para_text = p.text
+            if para_text:
+                for needle in ("date of quotation", "validity of quotation"):
+                    idx = para_text.lower().find(needle)
+                    if idx > 0 and para_text[idx-1] not in (" ", "\u00A0", "\t"):
+                        # Find the run that begins at or covers 'idx' and prefix a non-breaking space
+                        pos = 0
+                        for r in p.runs:
+                            begin = pos
+                            end = pos + len(r.text)
+                            pos = end
+                            if begin <= idx < end or (begin == idx == end and end == 0):
+                                try:
+                                    rt = r.text or ""
+                                    if not rt.startswith((" ", "\u00A0")):
+                                        r.text = "\u00A0" + rt
+                                except Exception:
+                                    pass
+                                break
+        except Exception:
+            pass
+
     # Final cleanup: remove any leftover demo placeholders like 'replace ... here'
     for p in search_paras:
         for r in p.runs:
             try:
                 if r.font.highlight_color == WD_COLOR_INDEX.YELLOW and r.text.strip().lower().startswith("replace"):
                     r.text = ""
+            except Exception:
+                pass
+
+    # Additional safety: replace explicit highlighted phrases found in updated 3.3 kW template
+    # so that values don't concatenate with the right-side labels.
+    phrase_map = {
+        "replace application reference here": data.get("application_reference", ""),
+        "replace electricity connection here": data.get("electricity_connection_no", ""),
+    }
+    for p in search_paras:
+        for r in p.runs:
+            try:
+                if r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
+                    txt = (r.text or "").strip()
+                    low = txt.lower()
+                    for ph, val in phrase_map.items():
+                        if ph in low and val:
+                            v = str(val)
+                            # ensure a non-breaking space at the end to separate from next label
+                            if not v.endswith(" "):
+                                v = v + "\u00A0"
+                            r.text = v
+                            break
             except Exception:
                 pass
 
@@ -841,6 +944,31 @@ def normalize_layout(doc: DocxDocument) -> None:
             except Exception:
                 pass
 
+    # Helper to set cell margins (in twips). Some PDF renderers collapse column boundaries
+    # visually when there is no inner padding; adding small margins improves separation.
+    def set_cell_margins(cell: _Cell, **margins_twips):
+        # margins_twips: top, start/left, bottom, end/right
+        try:
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            from docx.oxml.shared import OxmlElement, qn as _qn
+            mar = tcPr.find(_qn('w:tcMar'))
+            if mar is None:
+                mar = OxmlElement('w:tcMar')
+                tcPr.append(mar)
+            for k_xml, v in [('w:top', margins_twips.get('top')), ('w:start', margins_twips.get('start') or margins_twips.get('left')),
+                             ('w:bottom', margins_twips.get('bottom')), ('w:end', margins_twips.get('end') or margins_twips.get('right'))]:
+                if v is None:
+                    continue
+                el = mar.find(_qn(k_xml))
+                if el is None:
+                    el = OxmlElement(k_xml)
+                    mar.append(el)
+                el.set('w:w', str(int(v)))
+                el.set('w:type', 'dxa')
+        except Exception:
+            pass
+
     # Replace rupee+space globally to prevent breaks
     for p in iter_paragraphs_and_cells(doc):
         for r in p.runs:
@@ -904,6 +1032,70 @@ def normalize_layout(doc: DocxDocument) -> None:
                     set_col_width(table, 1, 2.3)
             except Exception:
                 pass
+
+        # Special-case for details table that contains label pairs like
+        # ('Product & Service' | 'Quotation No'), ('Application Reference' | 'Date of Quotation'),
+        # ('Electricity Connection No' | 'Validity of Quotation'). In 3.3 kW template the right
+        # column needs to be wider to prevent overlap/collision in PDF renderers.
+        try:
+            row_texts = []
+            for r in table.rows:
+                try:
+                    row_texts.append(" ".join(c.text.strip().lower() for c in r.cells))
+                except Exception:
+                    row_texts.append("")
+            if (
+                any(("product & service" in t and "quotation no" in t) for t in row_texts)
+                or any(("application reference" in t and "date of quotation" in t) for t in row_texts)
+                or any(("electricity connection no" in t and "validity of quotation" in t) for t in row_texts)
+            ):
+                table.autofit = False
+                # Give more space to the right column (~6.2in total content area)
+                # Tune for 3.3 kW template: left 2.8in, right 3.4in
+                set_col_width(table, 0, 2.8)
+                set_col_width(table, 1, 3.4)
+                # Also ensure paragraphs in cells are left-aligned
+                for r in table.rows:
+                    for c in r.cells:
+                        for p in c.paragraphs:
+                            try:
+                                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                # For right column paragraphs, add a tiny left indent to force gap
+                                # (LibreOffice sometimes collapses margins; indent is respected.)
+                                if c is r.cells[1]:
+                                    try:
+                                        p.paragraph_format.left_indent = Inches(0.08)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        # Add inner padding; right column gets extra left padding to create clear gap
+                        if c is r.cells[1]:
+                            set_cell_margins(c, left=240, right=90)
+                        else:
+                            set_cell_margins(c, left=120, right=90)
+
+                # Ensure a tiny visual gap at start of right column paragraphs.
+                # Some renderers visually butt right column text against the left column's content.
+                # Prefix a non-breaking space if the first run starts immediately with a letter/number.
+                try:
+                    for r in table.rows:
+                        if len(r.cells) < 2:
+                            continue
+                        right_cell = r.cells[1]
+                        if right_cell.paragraphs:
+                            first_p = right_cell.paragraphs[0]
+                            if first_p.runs:
+                                rt = first_p.runs[0].text or ""
+                                if rt and not rt.startswith((" ", "\u00A0")):
+                                    first_p.runs[0].text = "\u00A0\u00A0" + rt
+                            else:
+                                # If no runs yet, add one with a nbsp
+                                first_p.add_run("\u00A0\u00A0")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def convert_to_pdf(docx_path: str, target_pdf_path: str) -> Optional[str]:
@@ -988,8 +1180,10 @@ def save_to_db(conn: sqlite3.Connection, record: Dict[str, str]) -> None:
         """
         INSERT INTO invoices (
             quotation_no, product, customer_name, mobile, location, city, state, pincode,
-            staff_name, date_of_quotation, validity_date, docx_path, pdf_path, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            staff_name, date_of_quotation, validity_date,
+            application_reference, electricity_connection_no,
+            docx_path, pdf_path, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record.get("quotation_no"),
@@ -1003,6 +1197,8 @@ def save_to_db(conn: sqlite3.Connection, record: Dict[str, str]) -> None:
             record.get("staff_name"),
             record.get("date_of_quotation"),
             record.get("validity_date"),
+            record.get("application_reference"),
+            record.get("electricity_connection_no"),
             record.get("docx_path"),
             record.get("pdf_path"),
             now,
@@ -1207,9 +1403,11 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str], template_path: str) -> 
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(
             """
-            UPDATE invoices SET
-                product=?, customer_name=?, mobile=?, location=?, city=?, state=?, pincode=?, staff_name=?,
-                date_of_quotation=?, validity_date=?, docx_path=?, pdf_path=?, updated_at=?
+            UPDATE invoices
+            SET product=?, customer_name=?, mobile=?, location=?, city=?, state=?, pincode=?, staff_name=?,
+                date_of_quotation=?, validity_date=?,
+                application_reference=?, electricity_connection_no=?,
+                docx_path=?, pdf_path=?, updated_at=?
             WHERE id=?
             """,
             (
@@ -1223,6 +1421,8 @@ def edit_invoice(inv_id: int, form_data: Dict[str, str], template_path: str) -> 
                 form_data.get("staff_name"),
                 form_data.get("date_of_quotation"),
                 form_data.get("validity_date"),
+                form_data.get("application_reference"),
+                form_data.get("electricity_connection_no"),
                 None,
                 pdf_path,
                 now,
@@ -2607,6 +2807,9 @@ def render_create_form(
         city = st.text_input("City", value=(prefill.get("city") if prefill else ""), key=f"{ns}_city")
         state = st.text_input("State", value=(prefill.get("state") if prefill else ""), key=f"{ns}_state")
         pincode = st.text_input("Pincode", value=(prefill.get("pincode") if prefill else ""), key=f"{ns}_pincode")
+        # New fields (template-only)
+        application_reference = st.text_input("Application Reference", value=(prefill.get("application_reference") if prefill else ""), key=f"{ns}_app_ref")
+        electricity_connection_no = st.text_input("Electricity Connection No", value=(prefill.get("electricity_connection_no") if prefill else ""), key=f"{ns}_elec_conn")
         staff_name = st.text_input("Staff Name (kept only in DB)", value=(prefill.get("staff_name") if prefill else ""), key=f"{ns}_staff")
         # Show computed values inside the form (read-only)
         st.text_input("Date of Quotation", value=date_of_quotation.isoformat(), disabled=True, key=f"{ns}_doq_ro")
@@ -2632,6 +2835,9 @@ def render_create_form(
             "staff_name": staff_name.strip(),
             "date_of_quotation": date_of_quotation.isoformat(),
             "validity_date": validity_date.isoformat(),
+            # New template-only fields
+            "application_reference": application_reference.strip(),
+            "electricity_connection_no": electricity_connection_no.strip(),
         }
         # Minimal progress UI (non-intrusive)
         prog = st.progress(0, text="Starting…")
@@ -2965,7 +3171,7 @@ def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, quotation_no, product, customer_name, mobile, location, city, state, pincode, staff_name, date_of_quotation, validity_date FROM invoices WHERE id=?",
+            "SELECT id, quotation_no, product, customer_name, mobile, location, city, state, pincode, staff_name, date_of_quotation, validity_date, application_reference, electricity_connection_no FROM invoices WHERE id=?",
             (inv_id,),
         )
         r = cur.fetchone()
@@ -2984,6 +3190,8 @@ def fetch_full_record(inv_id: int) -> Optional[Dict[str, str]]:
             "staff_name": r[9],
             "date_of_quotation": r[10],
             "validity_date": r[11],
+            "application_reference": r[12],
+            "electricity_connection_no": r[13],
         }
     finally:
         conn.close()
